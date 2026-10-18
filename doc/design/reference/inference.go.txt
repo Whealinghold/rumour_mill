@@ -1,0 +1,179 @@
+package events
+
+import (
+	"fmt"
+	"sync"
+
+	"epic_whispers/server/internal/domain/shared"
+)
+
+// KnowledgeRequirement defines a single requirement for an inference rule.
+type KnowledgeRequirement struct {
+	Type          KnowledgeType
+	Subject       shared.EntityID // empty = any subject
+	MinConfidence float64
+	Source        *SourceType // nil = any source
+}
+
+// InferenceRule defines how to derive a new fact from combinations of existing facts.
+type InferenceRule struct {
+	ID         string
+	Requires   []KnowledgeRequirement
+	Produces   KnowledgeFact
+	Confidence float64
+}
+
+// InferenceEngine holds registered inference rules and runs them against KnowledgeBases.
+type InferenceEngine struct {
+	mu    sync.RWMutex
+	rules []InferenceRule
+}
+
+// NewInferenceEngine creates an empty inference engine.
+func NewInferenceEngine() *InferenceEngine {
+	return &InferenceEngine{
+		rules: make([]InferenceRule, 0),
+	}
+}
+
+// Register adds an inference rule. Rules are additive — new rules extend,
+// never modify existing ones.
+func (e *InferenceEngine) Register(rule InferenceRule) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.rules = append(e.rules, rule)
+}
+
+// RunInferences checks all registered rules against the given KnowledgeBase
+// and adds derived facts with Source=Inferred where requirements are met.
+func (e *InferenceEngine) RunInferences(kb *KnowledgeBase, now shared.GameTime) {
+	e.mu.RLock()
+	rules := make([]InferenceRule, len(e.rules))
+	copy(rules, e.rules)
+	e.mu.RUnlock()
+
+	for _, rule := range rules {
+		subjects := e.findMatchingSubjects(rule, kb)
+		for _, subject := range subjects {
+			derived := e.buildDerivedFact(rule, subject, now)
+			kb.Add(derived)
+		}
+	}
+}
+
+// findMatchingSubjects finds all subjects that satisfy every requirement in the rule.
+func (e *InferenceEngine) findMatchingSubjects(rule InferenceRule, kb *KnowledgeBase) []shared.EntityID {
+	// If any requirement specifies a fixed subject, only check that subject.
+	var fixedSubject shared.EntityID
+	for _, req := range rule.Requires {
+		if req.Subject != "" {
+			fixedSubject = req.Subject
+			break
+		}
+	}
+
+	if fixedSubject != "" {
+		if e.subjectMeetsRequirements(fixedSubject, rule, kb) {
+			return []shared.EntityID{fixedSubject}
+		}
+		return nil
+	}
+
+	// If Produces specifies a fixed subject, check that subject.
+	if rule.Produces.Subject != "" {
+		if e.subjectMeetsRequirements(rule.Produces.Subject, rule, kb) {
+			return []shared.EntityID{rule.Produces.Subject}
+		}
+		return nil
+	}
+
+	// Collect candidate subjects from facts matching any requirement.
+	candidates := make(map[shared.EntityID]bool)
+	for _, req := range rule.Requires {
+		for _, id := range kb.byType[req.Type] {
+			fact := kb.facts[id]
+			if fact.Confidence >= req.MinConfidence {
+				if req.Source == nil || fact.Source == *req.Source {
+					candidates[fact.Subject] = true
+				}
+			}
+		}
+	}
+
+	var results []shared.EntityID
+	for subject := range candidates {
+		if e.subjectMeetsRequirements(subject, rule, kb) {
+			results = append(results, subject)
+		}
+	}
+	return results
+}
+
+// subjectMeetsRequirements checks whether the given subject satisfies all requirements.
+func (e *InferenceEngine) subjectMeetsRequirements(subject shared.EntityID, rule InferenceRule, kb *KnowledgeBase) bool {
+	for _, req := range rule.Requires {
+		checkSubject := subject
+		if req.Subject != "" {
+			checkSubject = req.Subject
+		}
+
+		var facts []KnowledgeFact
+		for _, id := range kb.byType[req.Type] {
+			fact := kb.facts[id]
+			if fact.Subject == checkSubject {
+				facts = append(facts, fact)
+			}
+		}
+
+		found := false
+		for _, fact := range facts {
+			if fact.Confidence >= req.MinConfidence {
+				if req.Source == nil || fact.Source == *req.Source {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// buildDerivedFact constructs the inferred fact from a rule and subject.
+func (e *InferenceEngine) buildDerivedFact(rule InferenceRule, subject shared.EntityID, now shared.GameTime) KnowledgeFact {
+	factID := fmt.Sprintf("inferred_%s_%s", rule.ID, subject)
+
+	derived := KnowledgeFact{
+		ID:         factID,
+		Type:       rule.Produces.Type,
+		Subject:    subject,
+		Confidence: rule.Confidence,
+		Source:     SourceInferred,
+		Timestamp:  now,
+		Secret:     rule.Produces.Secret,
+	}
+
+	if rule.Produces.Expiry != nil {
+		expiry := *rule.Produces.Expiry
+		derived.Expiry = &expiry
+	}
+
+	// If Produces specifies a fixed subject, use that instead.
+	if rule.Produces.Subject != "" {
+		derived.Subject = rule.Produces.Subject
+		derived.ID = fmt.Sprintf("inferred_%s_%s", rule.ID, rule.Produces.Subject)
+	}
+
+	return derived
+}
+
+// defaultInferenceEngine is the package-level inference engine.
+var defaultInferenceEngine = NewInferenceEngine()
+
+// RegisterInferenceRule registers an inference rule on the default engine.
+// This is the additive entry point used by rule data files.
+func RegisterInferenceRule(rule InferenceRule) {
+	defaultInferenceEngine.Register(rule)
+}

@@ -1,0 +1,412 @@
+package events
+
+import (
+	"strings"
+
+	"epic_whispers/server/internal/domain/shared"
+)
+
+// --- Observation conditions ---
+
+// Witnessed returns true if the entity is in the same room as the event.
+func Witnessed() ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		return entity.GetRoomID() == event.RoomID
+	}
+}
+
+// InSameZone returns true if the entity is in the same zone as the event.
+func InSameZone() ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		return entity.GetZoneID() == event.Zone
+	}
+}
+
+// --- Entity checks ---
+
+// SourceIsPlayer returns true if the event source is a player.
+func SourceIsPlayer() ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		// We can't determine if source is player from Event alone without
+		// world context, so this condition checks if the event source is
+		// NOT the entity itself (basic proxy — real check would need world).
+		// For proper implementation, world would need GetEntity(id) method.
+		return entity.GetID() != event.SourceID
+	}
+}
+
+// SourceInFaction returns true if the event source belongs to the given faction.
+func SourceInFaction(factionID shared.FactionID) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		if event.Payload == nil {
+			return false
+		}
+		// Try typed payloads first
+		switch p := event.Payload.(type) {
+		case CombatKillPayload:
+			return p.VictimFaction == factionID
+		case CrimeCommittedPayload:
+			// Crime payload doesn't have faction; fallback to false
+			return false
+		default:
+			// Fallback: check map payload for faction keys
+			if m, ok := p.(map[string]interface{}); ok {
+				keys := []string{"faction", "attacker_faction", "source_faction", "target_faction"}
+				for _, key := range keys {
+					if v, exists := m[key]; exists {
+						if s, ok := v.(string); ok && shared.FactionID(s) == factionID {
+							return true
+						}
+					}
+				}
+			}
+			return false
+		}
+	}
+}
+
+// VictimInFaction returns true if the event victim belongs to the given faction.
+func VictimInFaction(factionID shared.FactionID) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		if event.Payload == nil {
+			return false
+		}
+		switch p := event.Payload.(type) {
+		case CombatKillPayload:
+			return p.VictimFaction == factionID
+		default:
+			return false
+		}
+	}
+}
+
+// SourceIsEnemy returns true if the event source is an enemy of the entity.
+func SourceIsEnemy() ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		// Disposition below -25 is considered hostile/enemy
+		return entity.GetDisposition(event.SourceID) < -25
+	}
+}
+
+// SourceIsAlly returns true if the event source is an ally of the entity.
+func SourceIsAlly() ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		// Disposition above 25 is considered friendly/ally
+		return entity.GetDisposition(event.SourceID) > 25
+	}
+}
+
+// VictimIsFriend returns true if the killed victim has a friend relationship with the entity.
+func VictimIsFriend() ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		payload, ok := event.Payload.(CombatKillPayload)
+		if !ok {
+			return false
+		}
+		for _, rel := range entity.GetRelationships() {
+			if rel.Target == string(payload.Victim) && rel.Type == "friend" {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// VictimIsFamily returns true if the killed victim has a family relationship with the entity.
+func VictimIsFamily() ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		payload, ok := event.Payload.(CombatKillPayload)
+		if !ok {
+			return false
+		}
+		for _, rel := range entity.GetRelationships() {
+			if rel.Target == string(payload.Victim) && rel.Type == "family" {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// CombatBehaviourIsFlee returns true if the entity's combat behaviour is "flee".
+func CombatBehaviourIsFlee() ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		return entity.GetCombatBehaviour() == "flee"
+	}
+}
+
+// CombatBehaviourIsWarrior returns true if the entity's combat behaviour is anything other than "flee".
+func CombatBehaviourIsWarrior() ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		return entity.GetCombatBehaviour() != "" && entity.GetCombatBehaviour() != "flee"
+	}
+}
+
+// ProfessionIs returns true if the entity exposes a profession matching the
+// given value. The match is case-insensitive. Entities that do not implement
+// the optional profession interface never match.
+func ProfessionIs(profession string) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		p, ok := entity.(interface{ GetProfession() string })
+		if !ok {
+			return false
+		}
+		return strings.EqualFold(p.GetProfession(), profession)
+	}
+}
+
+// ProfessionIn returns true if the entity exposes a profession matching any of
+// the supplied values.
+func ProfessionIn(professions ...string) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		p, ok := entity.(interface{ GetProfession() string })
+		if !ok {
+			return false
+		}
+		prof := p.GetProfession()
+		for _, candidate := range professions {
+			if strings.EqualFold(prof, candidate) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// RecipeIncludes returns true if the entity exposes a recipe list containing
+// the supplied recipe ID. Entities without the optional recipe interface never
+// match.
+func RecipeIncludes(recipeID string) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		r, ok := entity.(interface{ GetRecipes() []string })
+		if !ok {
+			return false
+		}
+		for _, id := range r.GetRecipes() {
+			if strings.EqualFold(id, recipeID) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// HaltCodeIs returns true when the event payload is a ResourceDepletedPayload
+// whose HaltCode matches the supplied code.
+func HaltCodeIs(haltCode string) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		payload, ok := event.Payload.(ResourceDepletedPayload)
+		if !ok {
+			return false
+		}
+		return strings.EqualFold(payload.HaltCode, haltCode)
+	}
+}
+
+// HaltCodeIn returns true when the event payload is a ResourceDepletedPayload
+// whose HaltCode is one of the supplied codes.
+func HaltCodeIn(haltCodes ...string) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		payload, ok := event.Payload.(ResourceDepletedPayload)
+		if !ok {
+			return false
+		}
+		for _, code := range haltCodes {
+			if strings.EqualFold(payload.HaltCode, code) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// ResourceDepletedSourceIsPlayer returns true when the event payload is a
+// ResourceDepletedPayload whose source was a player character.
+func ResourceDepletedSourceIsPlayer() ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		payload, ok := event.Payload.(ResourceDepletedPayload)
+		if !ok {
+			return false
+		}
+		return payload.SourceIsPlayer
+	}
+}
+
+// SuppliedCommodityIs returns true when the event payload is a
+// SettlementSuppliedPayload whose CommodityID matches the supplied value.
+func SuppliedCommodityIs(commodityID string) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		payload, ok := event.Payload.(SettlementSuppliedPayload)
+		if !ok {
+			return false
+		}
+		return strings.EqualFold(payload.CommodityID, commodityID)
+	}
+}
+
+// SuppliedCommodityIn returns true when the event payload is a
+// SettlementSuppliedPayload whose CommodityID is one of the supplied values.
+func SuppliedCommodityIn(commodityIDs ...string) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		payload, ok := event.Payload.(SettlementSuppliedPayload)
+		if !ok {
+			return false
+		}
+		for _, id := range commodityIDs {
+			if strings.EqualFold(payload.CommodityID, id) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// --- Knowledge checks ---
+
+// AlreadyKnows returns true if the entity has any fact of the given type
+// above the minimum confidence threshold (0.2).
+func AlreadyKnows(factType KnowledgeType) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		kb := entity.GetKnowledgeBase()
+		if kb == nil {
+			return false
+		}
+		facts := kb.QueryByType(factType)
+		return len(facts) > 0
+	}
+}
+
+// ConfidenceAbove returns true if the entity has any fact of the given type
+// with confidence strictly above the threshold.
+func ConfidenceAbove(factType KnowledgeType, threshold float64) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		kb := entity.GetKnowledgeBase()
+		if kb == nil {
+			return false
+		}
+		facts := kb.QueryByType(factType)
+		for _, f := range facts {
+			if f.Confidence > threshold {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// SourceIs returns true if the entity has any fact of the given type
+// with the specified source.
+func SourceIs(factType KnowledgeType, source SourceType) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		kb := entity.GetKnowledgeBase()
+		if kb == nil {
+			return false
+		}
+		facts := kb.QueryByType(factType)
+		for _, f := range facts {
+			if f.Source == source {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// SubjectIsPlayer returns true if the entity has any fact of the given type
+// whose subject is the event source (typically the player).
+func SubjectIsPlayer(factType KnowledgeType) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		kb := entity.GetKnowledgeBase()
+		if kb == nil {
+			return false
+		}
+		facts := kb.QueryByType(factType)
+		for _, f := range facts {
+			if f.Subject == event.SourceID {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// DetailSubtypeIs returns true if any fact of the given type has a detail
+// subtype matching the provided string.
+//
+// Stub: detail.subtype filtering is not yet fully implemented. This function
+// currently returns true unconditionally to allow rule authors to include the
+// expression without breaking existing rules.
+func DetailSubtypeIs(factType KnowledgeType, subtype string) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		// TODO: implement detail.subtype extraction from KnowledgeFact.Object
+		// once the detail schema is finalized.
+		_ = factType
+		_ = subtype
+		return true
+	}
+}
+
+// --- World state conditions ---
+
+// ZoneDreadAbove returns true if the event's zone has dread above the threshold.
+func ZoneDreadAbove(threshold int) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		if world == nil {
+			return false
+		}
+		return world.GetZoneDread(event.Zone) > threshold
+	}
+}
+
+// IsMarketDay returns true if today is a market day.
+func IsMarketDay() ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		if world == nil {
+			return false
+		}
+		return world.IsMarketDay()
+	}
+}
+
+// SeasonIs returns true if the current season matches the given month.
+func SeasonIs(month shared.Month) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		if world == nil {
+			return false
+		}
+		return world.Season() == month.String()
+	}
+}
+
+// --- Combinators ---
+
+// All returns a ConditionFn that passes only when all given conditions pass.
+func All(conditions ...ConditionFn) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		for _, c := range conditions {
+			if !c(entity, event, world) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// Any returns a ConditionFn that passes when any given condition passes.
+func Any(conditions ...ConditionFn) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		for _, c := range conditions {
+			if c(entity, event, world) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// Not returns a ConditionFn that inverts the given condition.
+func Not(condition ConditionFn) ConditionFn {
+	return func(entity EntityReader, event Event, world WorldReader) bool {
+		return !condition(entity, event, world)
+	}
+}

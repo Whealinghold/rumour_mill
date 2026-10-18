@@ -1,0 +1,23 @@
+package events
+
+// Pipeline executes rules from the registry against entities.
+type Pipeline struct {
+	registry *Registry
+}
+
+// NewPipeline creates a pipeline backed by the given registry.
+func NewPipeline(registry *Registry) *Pipeline {
+	return &Pipeline{registry: registry}
+}
+
+// Process runs all matching rules for the given entity and event.
+// Rules are evaluated in layer order (universal → faction → individual),
+// and within each layer by priority (lower number first).
+// If a rule has StopPropagation set, no lower-priority rules in that
+// same layer are executed.
+func (p *Pipeline) Process(entity EntityWriter, event Event, world WorldReader) {
+	sets := p.registry.getRulesForEntity(entity, event.Type)
+	for _, rs := range sets {
+		rs.run(entity, event, world)
+	}
+}

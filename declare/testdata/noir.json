@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "config": {
+    "knowledge": {
+      "source_ranks": { "testimony": 3, "tip": 2, "rumour": 1, "hunch": 0 }
+    },
+    "spread": { "decay_factor": 0.5, "received_kind": "rumour" },
+    "infer": { "derived_kind": "hunch" }
+  },
+  "rules": [
+    {
+      "id": "statement-taken", "layer": "city", "event": "interview",
+      "when": { "use": "here" },
+      "do": [ { "use": "add_fact", "args": { "type": "alibi_false", "confidence": 0.8, "source": "testimony" } } ]
+    },
+    {
+      "id": "lean-on-witness", "layer": "precinct", "scope": "14th", "event": "interview", "priority": 5,
+      "when": { "use": "here" },
+      "do": [ {
+        "use": "if",
+        "cond": { "use": "attr_is", "args": { "name": "nerve", "value": "low" } },
+        "then": { "use": "seq", "of": [
+          { "use": "add_fact", "args": { "type": "motive_known", "confidence": 0.6, "source": "tip" } },
+          { "use": "add_fact", "args": { "type": "case_leaked", "confidence": 1.0, "source": "testimony", "private": true } }
+        ] },
+        "else": { "use": "add_fact", "args": { "type": "motive_known", "confidence": 0.3, "source": "tip" } }
+      } ]
+    }
+  ],
+  "inference": [
+    {
+      "id": "person-of-interest",
+      "requires": [
+        { "type": "alibi_false", "sources": ["testimony"] },
+        { "type": "motive_known" }
+      ],
+      "produces": { "type": "person_of_interest", "private": true },
+      "confidence": 0.8
+    }
+  ]
+}

@@ -1,0 +1,140 @@
+package events
+
+import (
+	"epic_whispers/server/internal/domain/shared"
+)
+
+type KnowledgeBase struct {
+	facts     map[string]KnowledgeFact
+	byType    map[KnowledgeType][]string
+	bySubject map[shared.EntityID][]string
+}
+
+func NewKnowledgeBase() *KnowledgeBase {
+	return &KnowledgeBase{
+		facts:     make(map[string]KnowledgeFact),
+		byType:    make(map[KnowledgeType][]string),
+		bySubject: make(map[shared.EntityID][]string),
+	}
+}
+
+func (kb *KnowledgeBase) Add(fact KnowledgeFact) {
+	if fact.Confidence < 0.0 {
+		fact.Confidence = 0.0
+	}
+	if fact.Confidence > 1.0 {
+		fact.Confidence = 1.0
+	}
+
+	existing, exists := kb.facts[fact.ID]
+	if exists {
+		if sourceStrength(fact.Source) < sourceStrength(existing.Source) {
+			return
+		}
+		if sourceStrength(fact.Source) == sourceStrength(existing.Source) {
+			if fact.Confidence <= existing.Confidence {
+				return
+			}
+		}
+		kb.facts[fact.ID] = fact
+		return
+	}
+
+	kb.facts[fact.ID] = fact
+	kb.byType[fact.Type] = append(kb.byType[fact.Type], fact.ID)
+	kb.bySubject[fact.Subject] = append(kb.bySubject[fact.Subject], fact.ID)
+}
+
+// HasFact reports whether the knowledge base contains a fact with the given ID.
+func (kb *KnowledgeBase) HasFact(id string) bool {
+	_, ok := kb.facts[id]
+	return ok
+}
+
+func (kb *KnowledgeBase) Query(factType KnowledgeType, subject shared.EntityID) []KnowledgeFact {
+	var result []KnowledgeFact
+	for _, id := range kb.byType[factType] {
+		fact := kb.facts[id]
+		if fact.Subject == subject && fact.Confidence >= 0.2 {
+			result = append(result, fact)
+		}
+	}
+	return result
+}
+
+func (kb *KnowledgeBase) QueryByType(factType KnowledgeType) []KnowledgeFact {
+	var result []KnowledgeFact
+	for _, id := range kb.byType[factType] {
+		fact := kb.facts[id]
+		if fact.Confidence >= 0.2 {
+			result = append(result, fact)
+		}
+	}
+	return result
+}
+
+func (kb *KnowledgeBase) Spreadable(now shared.GameTime) []KnowledgeFact {
+	var result []KnowledgeFact
+	for _, fact := range kb.facts {
+		if fact.Secret {
+			continue
+		}
+		if fact.Confidence < 0.3 {
+			continue
+		}
+		if fact.Expiry != nil && afterExpiry(fact.Expiry, now) {
+			continue
+		}
+		result = append(result, fact)
+	}
+	return result
+}
+
+func (kb *KnowledgeBase) PruneExpired(now shared.GameTime) {
+	for id, fact := range kb.facts {
+		if fact.Expiry == nil {
+			continue
+		}
+		if afterExpiry(fact.Expiry, now) {
+			kb.removeFact(id)
+		}
+	}
+}
+
+// AllFacts returns every fact in the knowledge base, regardless of confidence or expiry.
+// Used for persistence and debugging.
+func (kb *KnowledgeBase) AllFacts() []KnowledgeFact {
+	result := make([]KnowledgeFact, 0, len(kb.facts))
+	for _, fact := range kb.facts {
+		result = append(result, fact)
+	}
+	return result
+}
+
+func (kb *KnowledgeBase) removeFact(id string) {
+	fact, exists := kb.facts[id]
+	if !exists {
+		return
+	}
+	delete(kb.facts, id)
+
+	ids := kb.byType[fact.Type]
+	for i, v := range ids {
+		if v == id {
+			kb.byType[fact.Type] = append(ids[:i], ids[i+1:]...)
+			break
+		}
+	}
+
+	ids = kb.bySubject[fact.Subject]
+	for i, v := range ids {
+		if v == id {
+			kb.bySubject[fact.Subject] = append(ids[:i], ids[i+1:]...)
+			break
+		}
+	}
+}
+
+func afterExpiry(expiry *shared.GameTime, now shared.GameTime) bool {
+	return expiry.ToUnix() <= now.ToUnix()
+}

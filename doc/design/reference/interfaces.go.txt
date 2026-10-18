@@ -1,0 +1,49 @@
+package events
+
+import "epic_whispers/server/internal/domain/shared"
+
+// Relationship represents a social bond declared for an entity.
+// It is a minimal DTO to avoid importing domain/npc.
+type Relationship struct {
+	Target  string
+	Type    string
+	Subtype string
+}
+
+// EntityReader provides read-only access to entity state for rule conditions.
+type EntityReader interface {
+	GetID() shared.EntityID
+	GetFactionID() shared.FactionID
+	GetRoomID() string
+	GetZoneID() string
+	IsPlayer() bool
+	GetKnowledgeBase() *KnowledgeBase
+	GetDisposition(target shared.EntityID) int
+	GetRelationships() []Relationship
+	GetCombatBehaviour() string
+}
+
+// EntityWriter provides read-write access to entity state for rule actions.
+type EntityWriter interface {
+	EntityReader
+	AdjustDisposition(target shared.EntityID, delta int)
+	SetDisposition(target shared.EntityID, value int)
+	AddGoal(goalType shared.GoalType, target shared.EntityID, reason string)
+	ClearGoal(goalType shared.GoalType)
+}
+
+// WorldReader provides read-only access to world state for rule evaluation.
+// This is a minimal events-local interface to avoid circular dependencies
+// with the conversation package's broader WorldReader.
+type WorldReader interface {
+	GetZoneDread(zoneID string) int
+	IsMarketDay() bool
+	Season() string
+}
+
+// ConditionFn evaluates whether a rule's condition is met for a given entity,
+// event, and world state.
+type ConditionFn func(entity EntityReader, event Event, world WorldReader) bool
+
+// ActionFn performs a side effect on an entity when a rule fires.
+type ActionFn func(entity EntityWriter, event Event, world WorldReader)

@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "config": {
+    "knowledge": {
+      "source_ranks": { "charted": 3, "handover": 3, "overheard": 2, "corridor_talk": 2, "clinical_guess": 1 },
+      "query_floor": 0.3
+    },
+    "rules": { "default_priority": 20 },
+    "spread": { "decay_factor": 0.85, "max_hops": 3, "received_kind": "corridor_talk" },
+    "infer": { "derived_kind": "clinical_guess", "max_passes": 2 }
+  },
+  "rules": [
+    {
+      "id": "alarm-charted", "layer": "role", "scope": "nurse", "event": "monitor_alarm",
+      "do": [ { "use": "add_fact", "args": { "type": "vitals_concerning", "confidence": 0.9, "source": "charted", "ttl": 48, "per_event": true } } ]
+    },
+    {
+      "id": "alarm-overheard", "layer": "role", "scope": "porter", "event": "monitor_alarm",
+      "do": [ { "use": "add_fact", "args": { "type": "vitals_concerning", "confidence": 0.4, "source": "overheard", "ttl": 12 } } ]
+    },
+    {
+      "id": "handover-escalate", "layer": "ward", "event": "shift_handover",
+      "when": { "use": "all", "of": [
+        { "use": "role_is", "args": { "roles": ["nurse", "doctor"] } },
+        { "use": "knows", "args": { "type": "vitals_concerning", "about_subject": true, "min_confidence": 0.5 } }
+      ] },
+      "do": [ { "use": "add_fact", "args": { "type": "escalation_pending", "confidence": 0.8, "source": "handover" } } ]
+    }
+  ],
+  "spreading": {
+    "filters": [
+      { "use": "not", "of": [ { "use": "listener_role_is", "args": { "roles": ["visitor", "patient"] } } ] }
+    ]
+  },
+  "inference": [
+    {
+      "id": "sepsis-watch",
+      "requires": [ { "type": "vitals_concerning", "min_confidence": 0.5 }, { "type": "labs_abnormal" } ],
+      "produces": { "type": "sepsis_risk", "ttl": 24 },
+      "confidence": 0.6
+    },
+    {
+      "id": "call-physician",
+      "requires": [ { "type": "sepsis_risk", "min_confidence": 0.5 } ],
+      "produces": { "type": "escalate_to_physician" },
+      "confidence": 0.5
+    }
+  ]
+}

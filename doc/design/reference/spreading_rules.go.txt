@@ -1,0 +1,89 @@
+package events
+
+import (
+	"sync"
+
+	"epic_whispers/server/internal/domain/shared"
+)
+
+// SpreadingFilter determines whether a fact can be shared between two entities.
+// All registered filters must return true for spreading to proceed.
+type SpreadingFilter func(teller, listener EntityReader, fact KnowledgeFact, world WorldReader) bool
+
+var (
+	spreadingFilters   []SpreadingFilter
+	spreadingFiltersMu sync.RWMutex
+)
+
+// RegisterSpreadingFilter adds a filter to the global spreading filter chain.
+// Filters are evaluated in registration order; any filter returning false blocks spreading.
+// This is an additive API — registering a new filter never requires modifying existing code.
+func RegisterSpreadingFilter(filter SpreadingFilter) {
+	spreadingFiltersMu.Lock()
+	defer spreadingFiltersMu.Unlock()
+	spreadingFilters = append(spreadingFilters, filter)
+}
+
+// WillTellAbout returns true if all registered spreading filters permit the fact to be shared.
+func WillTellAbout(teller, listener EntityReader, fact KnowledgeFact, world WorldReader) bool {
+	spreadingFiltersMu.RLock()
+	defer spreadingFiltersMu.RUnlock()
+
+	for _, filter := range spreadingFilters {
+		if !filter(teller, listener, fact, world) {
+			return false
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// Built-in spreading filters
+// ---------------------------------------------------------------------------
+
+// NeverSpreadSecretFilter blocks spreading of secret facts (defense in depth).
+// Spreadable already excludes secrets, but this filter provides an independent gate.
+func NeverSpreadSecretFilter(teller, listener EntityReader, fact KnowledgeFact, world WorldReader) bool {
+	return !fact.Secret
+}
+
+// TyrianToNativeCriminalFilter blocks Tyrian factions from spreading criminal
+// intel to native clans.
+func TyrianToNativeCriminalFilter(teller, listener EntityReader, fact KnowledgeFact, world WorldReader) bool {
+	if fact.Type != KnowledgeTypeEntityIsCriminal && fact.Type != KnowledgeTypeEntityIsOutlaw {
+		return true
+	}
+
+	tellerFaction := teller.GetFactionID()
+	listenerFaction := listener.GetFactionID()
+
+	isTyrian := tellerFaction == shared.FactionTyrianLegion ||
+		tellerFaction == shared.FactionTyrianMerchants ||
+		tellerFaction == shared.FactionTyrianPriesthood
+	isNative := listenerFaction == shared.FactionNativeClans ||
+		listenerFaction == shared.FactionDruidicOrder
+
+	if isTyrian && isNative {
+		return false
+	}
+	return true
+}
+
+// EnemyBenefitFilter blocks spreading to entities that are hostile to the fact's subject.
+func EnemyBenefitFilter(teller, listener EntityReader, fact KnowledgeFact, world WorldReader) bool {
+	subject := fact.Subject
+	if subject == "" {
+		return true
+	}
+	// If listener is hostile to the subject, don't tell them
+	if listener.GetDisposition(subject) <= -50 {
+		return false
+	}
+	return true
+}
+
+func init() {
+	RegisterSpreadingFilter(NeverSpreadSecretFilter)
+	RegisterSpreadingFilter(TyrianToNativeCriminalFilter)
+	RegisterSpreadingFilter(EnemyBenefitFilter)
+}

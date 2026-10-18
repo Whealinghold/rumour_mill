@@ -1,0 +1,94 @@
+package events
+
+import (
+	"fmt"
+
+	"epic_whispers/server/internal/domain/shared"
+)
+
+type SourceType int
+
+const (
+	SourceWitnessed SourceType = iota
+	SourceHeard
+	SourceInferred
+	SourceOfficial
+)
+
+func sourceStrength(s SourceType) int {
+	switch s {
+	case SourceWitnessed:
+		return 3
+	case SourceOfficial:
+		return 3
+	case SourceHeard:
+		return 2
+	case SourceInferred:
+		return 1
+	default:
+		return 0
+	}
+}
+
+type KnowledgeType string
+
+const (
+	KnowledgeTypeWitnessedKilling        KnowledgeType = "witnessed_killing"
+	KnowledgeTypeHeardAboutKilling       KnowledgeType = "heard_about_killing"
+	KnowledgeTypeFamilyMemberKilled      KnowledgeType = "family_member_killed"
+	KnowledgeTypeFriendKilled            KnowledgeType = "friend_killed"
+	KnowledgeTypeWitnessedTheft          KnowledgeType = "witnessed_theft"
+	KnowledgeTypeWitnessedAssault        KnowledgeType = "witnessed_assault"
+	KnowledgeTypeBarrowDisturbed         KnowledgeType = "barrow_disturbed"
+	KnowledgeTypeSacredSiteViolated      KnowledgeType = "sacred_site_violated"
+	KnowledgeTypeAllianceFormed          KnowledgeType = "alliance_formed"
+	KnowledgeTypeAllianceBroken          KnowledgeType = "alliance_broken"
+	KnowledgeTypeTradeRouteDisrupted     KnowledgeType = "trade_route_disrupted"
+	KnowledgeTypeFoodShortageImminent    KnowledgeType = "food_shortage_imminent"
+	KnowledgeTypeSeasonalGatheringNear   KnowledgeType = "seasonal_gathering_near"
+	KnowledgeTypeZoneDreadElevated       KnowledgeType = "zone_dread_elevated"
+	KnowledgeTypeEntityIsHostile         KnowledgeType = "entity_is_hostile"
+	KnowledgeTypeEntityIsAlly            KnowledgeType = "entity_is_ally"
+	KnowledgeTypeEntityIsCriminal        KnowledgeType = "entity_is_criminal"
+	KnowledgeTypeEntityIsOutlaw          KnowledgeType = "entity_is_outlaw"
+	KnowledgeTypeEntityIsDangerous       KnowledgeType = "entity_is_dangerous"
+	KnowledgeTypeEntityHasValuableGoods  KnowledgeType = "entity_has_valuable_goods"
+	KnowledgeTypeGarrisonStrengthChanged KnowledgeType = "garrison_strength_changed"
+	KnowledgeTypeMerchantRobbed          KnowledgeType = "merchant_robbed"
+	KnowledgeTypeEntityIsCorruptible     KnowledgeType = "entity_is_corruptible"
+	KnowledgeTypeGatheringCalled         KnowledgeType = "gathering_called"
+	KnowledgeTypeLivestockSlaughtered    KnowledgeType = "livestock_slaughtered"
+	KnowledgeTypeForestGameSlaughtered   KnowledgeType = "forest_game_slaughtered"
+	KnowledgeTypeSettlementSupplied      KnowledgeType = "settlement_supplied"
+	KnowledgeTypeGoodsShortageImminent   KnowledgeType = "goods_shortage_imminent"
+)
+
+type KnowledgeFact struct {
+	ID         string
+	Type       KnowledgeType
+	Subject    shared.EntityID
+	Object     interface{}
+	Confidence float64
+	Source     SourceType
+	Timestamp  shared.GameTime
+	Expiry     *shared.GameTime
+	Secret     bool
+}
+
+func MakeFactID(eventType EventType, source shared.EntityID, subject shared.EntityID, timestamp shared.GameTime) string {
+	return fmt.Sprintf("%s_%s_%s_%04d-%02d-%02dT%02d:%02d",
+		eventType, source, subject,
+		timestamp.Year, timestamp.Month, timestamp.Day,
+		timestamp.Hour, timestamp.Minute)
+}
+
+// MakeKnowledgeFactID returns a stable fact ID that includes the knowledge type so
+// multiple facts from the same event (e.g. witnessed_killing and entity_is_hostile) do not collide.
+// objectKey is an optional discriminator for facts that store payload-specific data (e.g. victim ID).
+func MakeKnowledgeFactID(factType KnowledgeType, eventType EventType, source shared.EntityID, holder shared.EntityID, timestamp shared.GameTime, objectKey string) string {
+	id := string(factType) + ":" + MakeFactID(eventType, source, holder, timestamp)
+	if objectKey != "" {
+		id += ":" + objectKey
+	}
+	return id
+}

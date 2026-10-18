@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "config": {
+    "knowledge": {
+      "source_ranks": { "announcement": 3, "overheard": 2, "grapevine": 2, "guess": 1 },
+      "max_facts": 40
+    },
+    "rules": { "on_action_error": "stop" },
+    "spread": { "decay_factor": 0.9, "max_hops": 4, "received_kind": "grapevine" },
+    "infer": { "derived_kind": "guess", "max_passes": 2 }
+  },
+  "rules": [
+    {
+      "id": "overhear-closed-door-meeting", "layer": "company", "event": "meeting_held",
+      "when": { "use": "all", "of": [
+        { "use": "here" },
+        { "use": "not", "of": [ { "use": "knows", "args": { "type": "layoffs_planned", "min_confidence": 0.4 } } ] }
+      ] },
+      "do": [ { "use": "add_fact", "args": { "type": "layoffs_planned", "confidence": 0.45, "source": "overheard", "ttl": 240 } } ]
+    },
+    {
+      "id": "finance-knows-the-numbers", "layer": "department", "scope": "finance", "event": "meeting_held",
+      "priority": 1, "stop": "all",
+      "when": { "use": "here" },
+      "do": [ { "use": "add_fact", "args": { "type": "layoffs_planned", "confidence": 0.95, "source": "announcement", "private": true } } ]
+    }
+  ],
+  "spreading": {
+    "filters": [
+      { "use": "not", "of": [ { "use": "all", "of": [
+        { "use": "listener_attr_is", "args": { "name": "role", "value": "manager" } },
+        { "use": "fact_type_in", "args": { "types": ["layoffs_planned", "promotion_pending"] } }
+      ] } ] }
+    ]
+  },
+  "inference": [
+    {
+      "id": "layoffs-hurt-morale",
+      "requires": [ { "type": "layoffs_planned", "min_confidence": 0.35 } ],
+      "produces": { "type": "morale_dropping" },
+      "confidence": 0.5
+    },
+    {
+      "id": "low-morale-means-resignations",
+      "requires": [ { "type": "morale_dropping", "min_confidence": 0.4 } ],
+      "produces": { "type": "resignations_coming" },
+      "confidence": 0.4
+    }
+  ]
+}

@@ -1,0 +1,96 @@
+package events
+
+import (
+	"sync"
+
+	"epic_whispers/server/internal/domain/shared"
+)
+
+// Registry stores rules layered by scope (universal → faction → individual).
+type Registry struct {
+	mu         sync.RWMutex
+	universal  map[EventType]*ruleSet
+	faction    map[shared.FactionID]map[EventType]*ruleSet
+	individual map[shared.EntityID]map[EventType]*ruleSet
+}
+
+// NewRegistry creates an empty rule registry.
+func NewRegistry() *Registry {
+	return &Registry{
+		universal:  make(map[EventType]*ruleSet),
+		faction:    make(map[shared.FactionID]map[EventType]*ruleSet),
+		individual: make(map[shared.EntityID]map[EventType]*ruleSet),
+	}
+}
+
+// RegisterUniversalRule adds a rule that applies to all entities.
+func (reg *Registry) RegisterUniversalRule(r Rule) {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+
+	rs, exists := reg.universal[r.EventType]
+	if !exists {
+		rs = newRuleSet()
+		reg.universal[r.EventType] = rs
+	}
+	rs.add(r)
+}
+
+// RegisterFactionRule adds a rule that applies only to entities in the given faction.
+func (reg *Registry) RegisterFactionRule(factionID shared.FactionID, r Rule) {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+
+	if reg.faction[factionID] == nil {
+		reg.faction[factionID] = make(map[EventType]*ruleSet)
+	}
+	rs, exists := reg.faction[factionID][r.EventType]
+	if !exists {
+		rs = newRuleSet()
+		reg.faction[factionID][r.EventType] = rs
+	}
+	rs.add(r)
+}
+
+// RegisterIndividualRule adds a rule that applies only to the specific entity.
+func (reg *Registry) RegisterIndividualRule(entityID shared.EntityID, r Rule) {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+
+	if reg.individual[entityID] == nil {
+		reg.individual[entityID] = make(map[EventType]*ruleSet)
+	}
+	rs, exists := reg.individual[entityID][r.EventType]
+	if !exists {
+		rs = newRuleSet()
+		reg.individual[entityID][r.EventType] = rs
+	}
+	rs.add(r)
+}
+
+// getRulesForEntity returns the merged list of ruleSets for an entity and event type,
+// in layer order: universal → faction → individual.
+func (reg *Registry) getRulesForEntity(entity EntityReader, eventType EventType) []*ruleSet {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+
+	var result []*ruleSet
+
+	if rs, ok := reg.universal[eventType]; ok {
+		result = append(result, rs)
+	}
+
+	if rsMap, ok := reg.faction[entity.GetFactionID()]; ok {
+		if rs, ok := rsMap[eventType]; ok {
+			result = append(result, rs)
+		}
+	}
+
+	if rsMap, ok := reg.individual[entity.GetID()]; ok {
+		if rs, ok := rsMap[eventType]; ok {
+			result = append(result, rs)
+		}
+	}
+
+	return result
+}

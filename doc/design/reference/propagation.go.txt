@@ -1,0 +1,43 @@
+package events
+
+import (
+	"epic_whispers/server/internal/domain/shared"
+)
+
+// DegradationFactor is the confidence multiplier applied when knowledge spreads.
+const DegradationFactor = 0.8
+
+// MinSpreadConfidence is the minimum confidence after degradation for a fact to be added.
+const MinSpreadConfidence = 0.2
+
+// SpreadKnowledge spreads spreadable facts from spreader to other NPCs in the same room.
+// For each spreadable fact, it checks WillTellAbout for each listener.
+// If allowed, confidence is degraded by DegradationFactor and source set to SourceHeard.
+// Facts below MinSpreadConfidence after degradation are not added.
+func SpreadKnowledge(spreader EntityReader, others []EntityWriter, world WorldReader, now shared.GameTime) {
+	kb := spreader.GetKnowledgeBase()
+	if kb == nil {
+		return
+	}
+
+	facts := kb.Spreadable(now)
+	for _, fact := range facts {
+		for _, listener := range others {
+			if !WillTellAbout(spreader, listener, fact, world) {
+				continue
+			}
+
+			degraded := fact
+			degraded.Confidence = fact.Confidence * DegradationFactor
+			if degraded.Confidence < MinSpreadConfidence {
+				continue
+			}
+			degraded.Source = SourceHeard
+
+			listenerKB := listener.GetKnowledgeBase()
+			if listenerKB != nil {
+				listenerKB.Add(degraded)
+			}
+		}
+	}
+}

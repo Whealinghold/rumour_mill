@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "config": {
+    "knowledge": {
+      "source_ranks": { "witnessed": 3, "customs_notice": 3, "hearsay": 2, "deduced": 1 },
+      "query_floor": 0.25
+    },
+    "rules": { "default_priority": 50 },
+    "spread": { "received_kind": "hearsay" },
+    "infer": { "derived_kind": "deduced" }
+  },
+  "rules": [
+    {
+      "id": "witness-inspection", "layer": "station", "event": "cargo_inspected",
+      "when": { "use": "here" },
+      "do": [ { "use": "add_fact", "args": { "type": "cargo_seized", "confidence": 0.9, "source": "witnessed", "ttl": 2000, "per_event": true } } ]
+    },
+    {
+      "id": "customs-record", "layer": "guild", "scope": "customs", "event": "cargo_inspected",
+      "priority": 5, "stop": "layer",
+      "do": [ { "use": "add_fact", "args": { "type": "ship_flagged", "confidence": 1.0, "source": "customs_notice" } } ]
+    }
+  ],
+  "spreading": {
+    "filters": [
+      { "use": "not", "of": [ { "use": "all", "of": [
+        { "use": "teller_attr_is", "args": { "name": "guild", "value": "customs" } },
+        { "use": "listener_attr_is", "args": { "name": "guild", "value": "haulers" } },
+        { "use": "fact_type_in", "args": { "types": ["ship_flagged", "captain_is_smuggler"] } }
+      ] } ] }
+    ]
+  },
+  "inference": [
+    {
+      "id": "flagged-and-seized-means-smuggler",
+      "requires": [
+        { "type": "ship_flagged", "min_confidence": 0.4 },
+        { "type": "cargo_seized", "min_confidence": 0.5 }
+      ],
+      "produces": { "type": "captain_is_smuggler", "ttl": 5000 },
+      "confidence": 0.7
+    }
+  ]
+}

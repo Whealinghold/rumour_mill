@@ -1,0 +1,51 @@
+package events
+
+import "sort"
+
+// RuleLayer defines which scope a rule applies to.
+type RuleLayer int
+
+const (
+	LayerUniversal RuleLayer = iota
+	LayerFaction
+	LayerIndividual
+)
+
+// Rule is a value object that binds an event type to a condition and action.
+type Rule struct {
+	ID              string
+	EventType       EventType
+	Condition       ConditionFn
+	Action          ActionFn
+	Priority        int // lower number = higher priority
+	StopPropagation bool
+}
+
+// ruleSet is a collection of rules for a single event type, sorted by priority.
+type ruleSet struct {
+	rules []Rule
+}
+
+func newRuleSet() *ruleSet {
+	return &ruleSet{rules: make([]Rule, 0)}
+}
+
+func (rs *ruleSet) add(r Rule) {
+	rs.rules = append(rs.rules, r)
+	sort.SliceStable(rs.rules, func(i, j int) bool {
+		return rs.rules[i].Priority < rs.rules[j].Priority
+	})
+}
+
+func (rs *ruleSet) run(entity EntityWriter, event Event, world WorldReader) {
+	for _, r := range rs.rules {
+		if r.Condition == nil || r.Condition(entity, event, world) {
+			if r.Action != nil {
+				r.Action(entity, event, world)
+			}
+			if r.StopPropagation {
+				break
+			}
+		}
+	}
+}

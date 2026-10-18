@@ -1,0 +1,187 @@
+package events
+
+import (
+	"epic_whispers/server/internal/domain/shared"
+)
+
+// --- Disposition actions ---
+
+// AdjustDisposition modifies the entity's disposition toward the event source
+// by the given delta.
+func AdjustDisposition(delta int) ActionFn {
+	return func(entity EntityWriter, event Event, world WorldReader) {
+		entity.AdjustDisposition(event.SourceID, delta)
+	}
+}
+
+// SetDisposition sets the entity's disposition toward the event source
+// to an absolute value.
+func SetDisposition(value int) ActionFn {
+	return func(entity EntityWriter, event Event, world WorldReader) {
+		entity.SetDisposition(event.SourceID, value)
+	}
+}
+
+// --- Goal actions ---
+
+// AddGoal pushes a reactive goal onto the entity's goal stack.
+// targetFn extracts the target EntityID from the event.
+func AddGoal(goalType shared.GoalType, targetFn func(event Event) shared.EntityID) ActionFn {
+	return AddGoalWithReason(goalType, targetFn, func(_ Event) string { return "event_reaction" })
+}
+
+// AddGoalWithReason pushes a reactive goal onto the entity's goal stack with a custom reason.
+// targetFn extracts the target EntityID; reasonFn extracts a descriptive reason from the event.
+func AddGoalWithReason(goalType shared.GoalType, targetFn func(event Event) shared.EntityID, reasonFn func(event Event) string) ActionFn {
+	return func(entity EntityWriter, event Event, world WorldReader) {
+		target := targetFn(event)
+		entity.AddGoal(goalType, target, reasonFn(event))
+	}
+}
+
+// ClearGoal removes all goals of the given type from the entity.
+func ClearGoal(goalType shared.GoalType) ActionFn {
+	return func(entity EntityWriter, event Event, world WorldReader) {
+		entity.ClearGoal(goalType)
+	}
+}
+
+// --- Knowledge actions ---
+
+// AddKnowledge adds or upgrades a knowledge fact on the entity.
+// The fact ID is deterministically generated from event data.
+func AddKnowledge(factType KnowledgeType, confidence float64) ActionFn {
+	return func(entity EntityWriter, event Event, world WorldReader) {
+		kb := entity.GetKnowledgeBase()
+		if kb == nil {
+			return
+		}
+		fact := KnowledgeFact{
+			ID:         MakeKnowledgeFactID(factType, event.Type, event.SourceID, entity.GetID(), event.Timestamp, ""),
+			Type:       factType,
+			Subject:    event.SourceID,
+			Confidence: confidence,
+			Source:     SourceWitnessed,
+			Timestamp:  event.Timestamp,
+			Secret:     false,
+		}
+		kb.Add(fact)
+	}
+}
+
+// AddKnowledgeWithExpiry adds a knowledge fact with an expiration time.
+func AddKnowledgeWithExpiry(factType KnowledgeType, confidence float64, duration shared.GameTime) ActionFn {
+	return func(entity EntityWriter, event Event, world WorldReader) {
+		kb := entity.GetKnowledgeBase()
+		if kb == nil {
+			return
+		}
+		expiry := addGameTime(event.Timestamp, duration)
+		fact := KnowledgeFact{
+			ID:         MakeKnowledgeFactID(factType, event.Type, event.SourceID, entity.GetID(), event.Timestamp, ""),
+			Type:       factType,
+			Subject:    event.SourceID,
+			Confidence: confidence,
+			Source:     SourceWitnessed,
+			Timestamp:  event.Timestamp,
+			Expiry:     &expiry,
+			Secret:     false,
+		}
+		kb.Add(fact)
+	}
+}
+
+// AddKnowledgeWithObject adds a knowledge fact with an arbitrary Object payload.
+func AddKnowledgeWithObject(factType KnowledgeType, confidence float64, objectFn func(event Event) interface{}, objectKeyFn func(event Event) string) ActionFn {
+	return func(entity EntityWriter, event Event, world WorldReader) {
+		kb := entity.GetKnowledgeBase()
+		if kb == nil {
+			return
+		}
+		fact := KnowledgeFact{
+			ID:         MakeKnowledgeFactID(factType, event.Type, event.SourceID, entity.GetID(), event.Timestamp, objectKeyFn(event)),
+			Type:       factType,
+			Subject:    event.SourceID,
+			Object:     objectFn(event),
+			Confidence: confidence,
+			Source:     SourceWitnessed,
+			Timestamp:  event.Timestamp,
+			Secret:     false,
+		}
+		kb.Add(fact)
+	}
+}
+
+// AddKnowledgeWithObjectAndExpiry adds a knowledge fact with an Object payload and expiration time.
+func AddKnowledgeWithObjectAndExpiry(factType KnowledgeType, confidence float64, objectFn func(event Event) interface{}, objectKeyFn func(event Event) string, duration shared.GameTime) ActionFn {
+	return func(entity EntityWriter, event Event, world WorldReader) {
+		kb := entity.GetKnowledgeBase()
+		if kb == nil {
+			return
+		}
+		expiry := addGameTime(event.Timestamp, duration)
+		fact := KnowledgeFact{
+			ID:         MakeKnowledgeFactID(factType, event.Type, event.SourceID, entity.GetID(), event.Timestamp, objectKeyFn(event)),
+			Type:       factType,
+			Subject:    event.SourceID,
+			Object:     objectFn(event),
+			Confidence: confidence,
+			Source:     SourceWitnessed,
+			Timestamp:  event.Timestamp,
+			Expiry:     &expiry,
+			Secret:     false,
+		}
+		kb.Add(fact)
+	}
+}
+
+// --- Economy actions ---
+
+// AdjustLocalSupply adjusts the supply level for an item category in the
+// entity's current zone.  This is a no-op stub until economy integration.
+func AdjustLocalSupply(category shared.ItemCategory, delta int) ActionFn {
+	return func(entity EntityWriter, event Event, world WorldReader) {
+		// Economy mutation through world is not supported by the minimal
+		// WorldReader interface to avoid cross-context coupling.
+		// Concrete implementations that have access to EconomyService
+		// can wrap this action or provide a richer WorldWriter.
+	}
+}
+
+// --- Sequencing combinators ---
+
+// Sequence executes actions in order left-to-right.
+func Sequence(actions ...ActionFn) ActionFn {
+	return func(entity EntityWriter, event Event, world WorldReader) {
+		for _, a := range actions {
+			a(entity, event, world)
+		}
+	}
+}
+
+// If branches on a condition: executes thenAction if condition passes,
+// otherwise elseAction (if provided).
+func If(condition ConditionFn, thenAction ActionFn, elseAction ActionFn) ActionFn {
+	return func(entity EntityWriter, event Event, world WorldReader) {
+		// For the condition check, we need an EntityReader.
+		// EntityWriter embeds EntityReader, so we can pass it directly.
+		if condition(entity, event, world) {
+			thenAction(entity, event, world)
+		} else if elseAction != nil {
+			elseAction(entity, event, world)
+		}
+	}
+}
+
+// addGameTime performs naive component-wise addition of two GameTime values.
+// This is sufficient for rule-generated durations; canonical time math lives
+// in the time package.
+func addGameTime(base, delta shared.GameTime) shared.GameTime {
+	return shared.GameTime{
+		Year:   base.Year + delta.Year,
+		Month:  base.Month + delta.Month,
+		Day:    base.Day + delta.Day,
+		Hour:   base.Hour + delta.Hour,
+		Minute: base.Minute + delta.Minute,
+	}
+}
