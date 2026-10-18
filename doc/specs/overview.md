@@ -69,7 +69,9 @@ Everything domain-specific enters through one of these. Nothing else is extensib
 | Layers | `rules.Layer[C]` | caller | how many tiers and how a context maps to scope keys |
 | Named conditions/actions | `declare.Catalog[C]` | caller | everything a rule can test or do |
 | Spreading policy | `logic.Condition[spread.Encounter]` via `spread.WithFilter` | caller | who may tell whom what |
-| Rumour distortion | `Spreader.Transform` func field | caller | optionally alter a fact in transit (the only hook of its kind) |
+| Rumour distortion | `spread.Transform` via the `Spreader.Transform` field | caller | optionally alter a fact in transit, given the teller, listener and tick (the `Encounter`) and the delivered copy |
+| Belief fading | `knowledge.Fader` via `knowledge.WithFader` | option | how a fact's confidence weakens, or the fact is forgotten, as ticks pass; run by the caller via `Store.Fade` |
+| Fade policy | `knowledge.Config.Fade` | config | built-in exponential half-lives per source kind and a forget threshold; off by default |
 | Inference rules | `[]infer.Rule` | config data | derivations |
 | Time | `knowledge.Tick` parameter on every time-sensitive call | caller | expiry, observation time |
 

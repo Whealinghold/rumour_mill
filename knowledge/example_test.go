@@ -98,3 +98,52 @@ func Example_office() {
 	// at 220: [reorg]
 	// pruned: 1
 }
+
+// A harbour market where rumours fade by a custom linear curve: a witnessed
+// fact never weakens, an overheard one loses 0.1 per 100 ticks, and anything
+// below 0.15 is forgotten.
+func ExampleStore_Fade() {
+	cfg := knowledge.DefaultConfig()
+	cfg.Fade.ForgetBelow = 0.15
+	linear := func(f knowledge.Fact, now, elapsed knowledge.Tick) (float64, bool) {
+		if f.Source == "witnessed" {
+			return f.Confidence, false
+		}
+		return f.Confidence - 0.1*float64(elapsed)/100, false
+	}
+	store, _ := knowledge.NewStore(cfg, knowledge.WithFader(linear))
+	store.Add(knowledge.Fact{ID: "salt", Type: "price_rumour", Subject: "salt", Confidence: 0.4, Source: "overheard"})
+	store.Add(knowledge.Fact{ID: "rope", Type: "price_rumour", Subject: "rope", Confidence: 0.9, Source: "witnessed"})
+
+	for _, now := range []knowledge.Tick{100, 200, 300} {
+		res := store.Fade(now)
+		fmt.Println(now, "changed:", res.Changed, "forgotten:", res.Forgotten)
+	}
+
+	// Output:
+	// 100 changed: [salt] forgotten: []
+	// 200 changed: [salt] forgotten: []
+	// 300 changed: [] forgotten: [salt]
+}
+
+// The same harbour market, faded by the built-in half-life policy from config
+// alone: overheard rumours halve every 100 ticks, witnessed facts never fade,
+// and anything below 0.15 is forgotten. Mirrors the README Fade snippet.
+func Example_fadeConfig() {
+	cfg := knowledge.DefaultConfig()
+	cfg.Fade = knowledge.FadeConfig{HalfLives: map[string]int64{"overheard": 100}, ForgetBelow: 0.15}
+	store, _ := knowledge.NewStore(cfg)
+	store.Add(knowledge.Fact{ID: "salt", Type: "price_rumour", Subject: "salt", Confidence: 0.8, Source: "overheard"})
+	store.Add(knowledge.Fact{ID: "rope", Type: "price_rumour", Subject: "rope", Confidence: 0.8, Source: "witnessed"})
+
+	for _, now := range []knowledge.Tick{100, 200, 300} {
+		res := store.Fade(now) // res.Changed and res.Forgotten list fact IDs
+		salt, _ := store.Get("salt")
+		fmt.Printf("%d changed: %v forgotten: %v salt: %.2f\n", now, res.Changed, res.Forgotten, salt.Confidence)
+	}
+
+	// Output:
+	// 100 changed: [salt] forgotten: [] salt: 0.40
+	// 200 changed: [salt] forgotten: [] salt: 0.20
+	// 300 changed: [] forgotten: [salt] salt: 0.00
+}

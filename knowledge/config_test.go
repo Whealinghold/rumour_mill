@@ -1,8 +1,10 @@
 package knowledge
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -25,6 +27,7 @@ func TestDefaultConfigValues(t *testing.T) {
 		UnrankedRank: 0,
 		QueryFloor:   0.2,
 		MaxFacts:     0,
+		Fade:         FadeConfig{HalfLives: map[string]int64{}},
 	}
 	if got := DefaultConfig(); !reflect.DeepEqual(got, want) {
 		t.Errorf("DefaultConfig() = %+v, want %+v", got, want)
@@ -159,6 +162,7 @@ func TestMaxFactsDefaultAndOverride(t *testing.T) {
 	}
 }
 
+// S13: every invalid fade config yields ErrInvalidConfig.
 func TestConfigValidate(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -173,6 +177,15 @@ func TestConfigValidate(t *testing.T) {
 		{"negative max facts", func(c *Config) { c.MaxFacts = -1 }, true},
 		{"empty source name", func(c *Config) { c.SourceRanks[""] = 1 }, true},
 		{"nil rank map is fine", func(c *Config) { c.SourceRanks = nil }, false},
+		{"negative half life", func(c *Config) { c.Fade.HalfLives["overheard"] = -1 }, true},
+		{"zero half life is fine", func(c *Config) { c.Fade.HalfLives["overheard"] = 0 }, false},
+		{"negative default half life", func(c *Config) { c.Fade.DefaultHalfLife = -1 }, true},
+		{"empty half life key", func(c *Config) { c.Fade.HalfLives[""] = 5 }, true},
+		{"nil half life map is fine", func(c *Config) { c.Fade.HalfLives = nil }, false},
+		{"forget below 1 is fine", func(c *Config) { c.Fade.ForgetBelow = 1 }, false},
+		{"forget below above 1", func(c *Config) { c.Fade.ForgetBelow = 1.1 }, true},
+		{"forget below negative", func(c *Config) { c.Fade.ForgetBelow = -0.1 }, true},
+		{"forget below NaN", func(c *Config) { c.Fade.ForgetBelow = nan() }, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -196,8 +209,18 @@ func TestValidateReportsEveryProblem(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.QueryFloor = 2
 	cfg.MaxFacts = -1
-	if err := cfg.Validate(); err == nil || len(err.Error()) < 20 {
+	cfg.Fade.DefaultHalfLife = -1
+	cfg.Fade.ForgetBelow = 2
+	cfg.Fade.HalfLives["overheard"] = -5
+	cfg.Fade.HalfLives[""] = 5
+	err := cfg.Validate()
+	if err == nil || !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("expected a joined error, got %v", err)
+	}
+	for _, want := range []string{"query_floor", "max_facts", "default_half_life", "forget_below", `half_lives["overheard"]`, "fade.half_lives has an empty source name"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
 	}
 }
 
@@ -216,5 +239,43 @@ func TestZeroConfigWorks(t *testing.T) {
 	// All kinds share UnrankedRank, so equal-rank rules apply.
 	if res, _ := s.Add(fact("other", 0.5)); res.Outcome != Replaced {
 		t.Errorf("outcome = %v, want Replaced (equal rank, higher confidence)", res.Outcome)
+	}
+}
+
+// No yaml decoder is available to this module (stdlib only), so the json
+// and yaml struct tags of the fade config are asserted directly, and the json
+// tags are also exercised through encoding/json.
+func TestFadeConfigTags(t *testing.T) {
+	tests := []struct {
+		typ         reflect.Type
+		field, name string
+	}{
+		{reflect.TypeOf(Config{}), "Fade", "fade"},
+		{reflect.TypeOf(FadeConfig{}), "HalfLives", "half_lives"},
+		{reflect.TypeOf(FadeConfig{}), "DefaultHalfLife", "default_half_life"},
+		{reflect.TypeOf(FadeConfig{}), "ForgetBelow", "forget_below"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.field, func(t *testing.T) {
+			sf, ok := tc.typ.FieldByName(tc.field)
+			if !ok {
+				t.Fatalf("no field %s", tc.field)
+			}
+			if got := sf.Tag.Get("json"); got != tc.name {
+				t.Errorf("json tag = %q, want %q", got, tc.name)
+			}
+			if got := sf.Tag.Get("yaml"); got != tc.name {
+				t.Errorf("yaml tag = %q, want %q", got, tc.name)
+			}
+		})
+	}
+	var cfg Config
+	doc := `{"fade": {"half_lives": {"overheard": 100}, "default_half_life": 7, "forget_below": 0.15}}`
+	if err := json.Unmarshal([]byte(doc), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	want := FadeConfig{HalfLives: map[string]int64{"overheard": 100}, DefaultHalfLife: 7, ForgetBelow: 0.15}
+	if !reflect.DeepEqual(cfg.Fade, want) {
+		t.Errorf("decoded %+v, want %+v", cfg.Fade, want)
 	}
 }

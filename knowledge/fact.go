@@ -22,6 +22,7 @@ type Fact struct {
 	Source        string  // caller-defined source kind; required
 	Prov          Provenance
 	Observed      Tick  // when this holder acquired or last upgraded the fact
+	FadedAt       Tick  // tick through which Fade has been applied; 0 = never faded; not part of identity, not validated by Add
 	Expiry        *Tick // nil = never; expired when *Expiry <= now
 	Private       bool  // never leaves the holder through spreading
 }

@@ -22,6 +22,7 @@ type Store struct {
 	cfg   Config
 	merge MergePolicy
 	facts map[string]Fact
+	fader Fader
 }
 
 // Option configures a Store at construction.
@@ -43,9 +44,13 @@ func NewStore(cfg Config, opts ...Option) (*Store, error) {
 		return nil, err
 	}
 	cfg.SourceRanks = maps.Clone(cfg.SourceRanks)
+	cfg.Fade.HalfLives = maps.Clone(cfg.Fade.HalfLives)
 	s := &Store{cfg: cfg, merge: RankThenConfidence, facts: make(map[string]Fact)}
 	for _, o := range opts {
 		o(s)
+	}
+	if s.fader == nil {
+		s.fader = exponentialFader(s.cfg.Fade)
 	}
 	return s, nil
 }

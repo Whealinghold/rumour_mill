@@ -5,6 +5,25 @@ All notable changes to this project are recorded here. The format follows
 `v0.x` until its API has been used by at least two real consumers; minor
 versions may break compatibility.
 
+## [Unreleased]
+
+### Changed
+- `spread` now resets `FadedAt` to 0 on the listener's copy of a delivered fact; the teller's fact keeps its own.
+- Breaking: `spread.Spreader.Transform` now has the named type
+  `spread.Transform`, `func(e Encounter, delivered knowledge.Fact) knowledge.Fact`.
+  Migrate with a one-line wrapper: `func(_ spread.Encounter, f knowledge.Fact) knowledge.Fact { return old(f) }`.
+
+### Added
+- `spread.Result.Offered` and `spread.Result.Dropped` (`Filtered`, `BackToSource`,
+  `BelowMinConfidence`, `TransformDropped`) explain offers that did not arrive.
+- `knowledge.FadeResult.Examined` and `Invalid` expose a Fade that is not wired
+  up or a Fader returning NaN.
+- `knowledge.Fact.FadedAt` (settle point of the last fade; hand-written
+  serialisers must persist it), `knowledge.Fader`, `knowledge.FadeResult`,
+  `knowledge.WithFader`, `(*Store).Fade(now)`, and `knowledge.Config.Fade`
+  (`half_lives`, `default_half_life`, `forget_below`) with a built-in exponential
+  half-life policy. Off by default; also loadable through `declare`.
+
 ## [0.1.0] - unreleased (first tag candidate)
 
 First complete slice of the library. Standard library only, no third-party

@@ -68,7 +68,7 @@ func Example_office() {
 	cfg.MaxHops = 4
 	cfg.ReceivedKind = "grapevine"
 	sp, _ := spread.New(cfg)
-	sp.Transform = func(f knowledge.Fact) knowledge.Fact {
+	sp.Transform = func(_ spread.Encounter, f knowledge.Fact) knowledge.Fact {
 		f.Confidence += 0.05 // each retelling sounds a little surer
 		f.Payload = fmt.Sprint(f.Payload, "!")
 		return f
@@ -127,4 +127,42 @@ func Example_noir() {
 	// detective tells informant: alibi at 0.50
 	// informant tells barkeep: alibi at 0.25
 	// barkeep tells cabbie nothing
+}
+
+// One context-aware hook covers a boastful teller, a sceptical listener and
+// stale news, with no per-holder spreaders.
+func Example_transformContext() {
+	sp, _ := spread.New(spread.DefaultConfig())
+	sp.Transform = func(e spread.Encounter, d knowledge.Fact) knowledge.Fact {
+		if e.Teller.ID() == "gossip-bram" {
+			d.Confidence += 0.1
+		}
+		if e.Listener.ID() == "sceptic-ola" {
+			d.Confidence /= 2
+		}
+		if e.Now-e.Fact.Observed > 50 {
+			d.Confidence /= 2
+		}
+		return d
+	}
+	tell := func(teller, listener string, now knowledge.Tick) {
+		a, b := newPerson(teller, knowledge.DefaultConfig()), newPerson(listener, knowledge.DefaultConfig())
+		a.kb.Add(knowledge.Fact{ID: "cargo_late", Type: "cargo_late", Confidence: 0.8, Source: "observed"})
+		sp.Spread(a, holders(b), now)
+		if f, ok := b.kb.Get("cargo_late"); ok {
+			fmt.Printf("%s -> %s at %d: %.2f\n", teller, listener, now, f.Confidence)
+		} else {
+			fmt.Printf("%s -> %s at %d: dropped\n", teller, listener, now)
+		}
+	}
+	tell("trader", "neutral", 40)
+	tell("gossip-bram", "neutral", 40)
+	tell("gossip-bram", "sceptic-ola", 40)
+	tell("trader", "neutral", 90)
+
+	// Output:
+	// trader -> neutral at 40: 0.64
+	// gossip-bram -> neutral at 40: 0.74
+	// gossip-bram -> sceptic-ola at 40: 0.37
+	// trader -> neutral at 90: 0.32
 }

@@ -2,7 +2,7 @@
 
 High-level plan for improving rumour_mill after the v0.1.0 candidate. It lists capabilities, not designs; each item gets its own spec (`doc/rules/specs.md`) before any code. Stages are ordered by value for effort, and later stages are only started when a real consumer needs them. The library stays v0.x until at least two real consumers have used it.
 
-## Stage 1: richer rumour behaviour
+## Stage 1: richer rumour behaviour (done)
 
 Goal: let rumours change in transit based on who is talking, to whom, and when, without adding more hooks.
 

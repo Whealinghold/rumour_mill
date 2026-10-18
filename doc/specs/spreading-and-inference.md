@@ -28,13 +28,26 @@ type Encounter struct {
     Now              knowledge.Tick
 }
 
+// Transform distorts a fact in transit. It receives the same Encounter the
+// filters judged (teller, listener, the teller's fact before decay, current
+// tick) and the copy about to be delivered (decayed confidence, new source and
+// provenance already applied), and returns what is actually delivered. It may
+// change Confidence, Payload and Expiry. ID, Type, Subject, Discriminator,
+// Source, Prov, Observed and Private (and FadedAt, which is reset to zero on
+// the copy) are restored afterwards, so a transform cannot change what a fact
+// is or forge its origin. Treat the Encounter, including
+// Encounter.Fact.Prov.Premises, as read-only: the premises slice is shared
+// across the deliveries of one Spread call, and this is documented, not
+// enforced. Age is e.Now - e.Fact.Observed: ticks since the teller acquired or
+// last upgraded the fact, not since the original event. A panic propagates.
+// Transform is called synchronously on the caller's goroutine. It is not safe for
+// concurrent use against a shared store.
+type Transform func(e Encounter, delivered knowledge.Fact) knowledge.Fact
+
 type Spreader struct {
-    // Transform, if non-nil, receives the copy about to be delivered (decayed
-    // confidence, new source and provenance already applied) and returns what is
-    // actually delivered. It may change Confidence, Payload and Expiry. ID, Type,
-    // Subject, Discriminator, Source, Prov, Observed and Private are restored
-    // afterwards, so a transform cannot change what a fact is or forge its origin.
-    Transform func(knowledge.Fact) knowledge.Fact
+    // Transform, if non-nil, is applied to every delivery that passed the
+    // filters; see the Transform type. Nil leaves the delivered copy as built.
+    Transform Transform
     /* unexported */
 }
 
@@ -50,7 +63,21 @@ type Transfer struct {
     Confidence float64           // as delivered
     Outcome    knowledge.Outcome // what the listener's store did with it
 }
-type Result struct{ Transfers []Transfer }
+// Dropped counts offers that did not become a delivery, by reason.
+type Dropped struct {
+    Filtered           int // a filter said no
+    BackToSource       int // SkipBackToSource applied
+    BelowMinConfidence int // decayed or transformed confidence under MinConfidence
+    TransformDropped   int // Transform returned a NaN confidence
+}
+
+// Offered counts every (fact, listener) pair considered, so
+// Offered == len(Transfers) + sum(Dropped) + store errors.
+type Result struct {
+    Transfers []Transfer
+    Offered   int
+    Dropped   Dropped
+}
 ```
 
 Filters are ordinary `logic.Condition`s over `Encounter`, written in Go or built from data (see [declarative](declarative.md)), and composable with `logic.All/Any/Not`. A filter needing the caller's concrete types type-asserts `e.Teller`/`e.Listener`.
@@ -87,7 +114,7 @@ func (c Config) Validate() error
    1. If `SkipBackToSource` and `Prov.From == listener.ID()`, skip.
    2. Run the filters on the `Encounter`, in the order added, short-circuiting; any `false` skips.
    3. Build the copy: same `ID`, `Type`, `Subject`, `Discriminator`, `Payload`, `Expiry`; `Confidence = fact.Confidence × DecayFactor`; `Source = ReceivedKind`; `Observed = now`; `Prov = {From: teller.ID(), Hops: fact.Prov.Hops+1, EventID: fact.Prov.EventID}` (premises not forwarded); `Private = false`.
-   4. Apply `Transform` if set, restore the fixed fields (see A2), clamp confidence to `[0,1]`.
+   4. Apply `Transform` if set, passing the same `Encounter` the filters judged (built once per listener and fact) and the copy from step 3; then restore the fixed fields (see A2), clamp confidence to `[0,1]`. Position is unchanged: after the copy is built, before the `MinConfidence` check. The teller's store and the `Encounter` are not modified on the transform's behalf. The copy's `FadedAt` is reset to zero: the listener acquired the fact at `now`, so the teller's settle point does not carry over.
    5. If confidence `< MinConfidence`, skip.
    6. `listener.Knowledge().Add(copy)`; record a `Transfer` with the store's outcome. Normal merge rules apply, so a listener holding a better-ranked or stronger version is unaffected (`Rejected`).
 4. The teller's store is never modified.
@@ -96,11 +123,11 @@ The teller's facts are read once up front; listener stores are written one at a 
 
 ## A5. Error cases
 
-`ErrInvalidConfig` from `New`: `DecayFactor` outside `(0,1]`; `MinConfidence` or `MinSourceConfidence` outside `[0,1]`; `MaxHops < 0`; empty `ReceivedKind`. `Spread` returns store errors (joined), for example `knowledge.ErrIdentityMismatch`; listeners already processed keep their facts (not transactional). Nil listeners, the teller itself and holders without a store are skipped. A nil filter is ignored. A transform that returns a NaN confidence drops that delivery. Panics from caller filters/transform propagate.
+`ErrInvalidConfig` from `New`: `DecayFactor` outside `(0,1]`; `MinConfidence` or `MinSourceConfidence` outside `[0,1]`; `MaxHops < 0`; empty `ReceivedKind`. `Spread` returns store errors (joined), for example `knowledge.ErrIdentityMismatch`; listeners already processed keep their facts (not transactional). Nil listeners, the teller itself and holders without a store are skipped. A nil filter is ignored. A transform that returns a NaN confidence drops that delivery; a nil `Transform` behaves as if unset. Panics from caller filters/transform propagate (nothing recovers them, so listeners already processed keep their facts).
 
 ## A6. Concurrency and determinism
 
-`Spreader` holds no mutable state. It is **not safe for concurrent use against shared stores**, because `knowledge.Store` is not; the caller serialises access (for example one lock per holder, taken in a consistent order, or one lock for the whole simulation step). There is no randomness. Time enters only through `now`.
+`Spreader` holds no mutable state. It is **not safe for concurrent use against shared stores**, because `knowledge.Store` is not: `Spread` and `Store.Fade` (see [knowledge](knowledge.md)) must not run concurrently against the same store, and the `Transform` is called on the caller's goroutine. The caller serialises access (for example one lock per holder, taken in a consistent order, or one lock for the whole simulation step). There is no randomness. Time enters only through `now`.
 
 ## A7. Original hardcoded thing → how it is configurable here
 
@@ -117,7 +144,7 @@ The teller's facts are read once up front; listener stores are written one at a 
 | `WillTellAbout(..., world)` with an ambient world reader | Filters get an `Encounter`; world access via the caller's closure |
 | Spread to "other NPCs in the same room" | Caller passes the listener slice |
 | No hop limit, no echo protection | `MaxHops` (default unlimited), `SkipBackToSource` (default on) |
-| Confidence formula fixed | `DecayFactor` plus the single optional `Transform` hook |
+| Confidence formula fixed | `Config.DecayFactor` plus the optional context-aware `Transform` hook (sees teller, listener, the teller's fact and the tick) |
 | Nondeterministic map iteration | Candidates by confidence then ID; listeners in caller order |
 
 ## A8. Worked examples
@@ -153,13 +180,34 @@ cfg.DecayFactor = 0.9 // office gossip barely degrades
 cfg.MaxHops = 4       // never past the fourth retelling
 cfg.ReceivedKind = "grapevine"
 sp, _ := spread.New(cfg, spread.WithFilter(neverTellBossAbout))
-sp.Transform = func(f knowledge.Fact) knowledge.Fact { // embellishment: each retelling sounds a bit surer
+sp.Transform = func(_ spread.Encounter, f knowledge.Fact) knowledge.Fact { // embellishment: each retelling sounds a bit surer
     f.Confidence = math.Min(1, f.Confidence+0.05)
     return f
 }
 ```
 
 A `layoffs_planned` fact at `0.5` first-hand: hop 1 `0.5×0.9+0.05 = 0.5`, hop 2 `0.5`, and so on, hovering near `0.5` because decay and embellishment roughly cancel; at hop 4 its holder has `Hops == MaxHops` and cannot retell it. `neverTellBossAbout` is a caller filter: listener's role is `manager` and the fact type is one of `layoffs_planned`, `promotion_pending`.
+
+### Harbour market (exercises a context-aware `Transform`: teller, listener, age)
+
+```go
+cfg := spread.DefaultConfig() // decay 0.8, min confidence 0.2
+sp, _ := spread.New(cfg)
+sp.Transform = func(e spread.Encounter, d knowledge.Fact) knowledge.Fact {
+    if e.Teller.ID() == "gossip-bram" { // a boastful teller inflates it
+        d.Confidence += 0.1
+    }
+    if e.Listener.ID() == "sceptic-ola" { // a sceptical listener discounts it
+        d.Confidence /= 2
+    }
+    if e.Now-e.Fact.Observed > 50 { // stale news is told less confidently
+        d.Confidence /= 2
+    }
+    return d
+}
+```
+
+One hook, no per-holder spreaders. A `cargo_late` fact held at `0.8` and observed at tick `0` decays to `0.64` on delivery. Told by another trader to a neutral listener at tick `40` it arrives at `0.64` (age 40, no condition applies). Told by Bram at tick `40` it arrives at `0.74`. Told by Bram to Ola at tick `40`: `(0.64+0.1)/2 = 0.37`. Told at tick `90` (age 90) to a neutral listener it arrives at `0.32`; if the transform had instead returned `0.15` the delivery would be skipped, because the `MinConfidence` check runs after the transform. `e.Fact.Confidence` is still `0.8` (the teller's version before decay), so a transform can also compare the two.
 
 ---
 

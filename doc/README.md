@@ -37,9 +37,10 @@ Phase 1 specs approved with changes (see "Review changes" below). All packages a
 
 - [roadmap](roadmap.md): staged plan for improving the library after v0.1.0
 
-### Roadmap PRDs (drafted, not yet approved or implemented)
+### Roadmap PRDs (stage 1 implemented; others drafted)
 One PRD per roadmap stage. Stage 3's recipes should land after Stages 1 and 2; Stages 4 and 5 are gated on measured or real consumer need.
-- [stage 1](specs/prd-stage1-richer-rumour-behaviour.md): context-aware `Transform`, time-based fading (`Store.Fade`, `Fader`, `Fact.FadedAt`)
+- [stage 1](specs/prd-stage1-richer-rumour-behaviour.md): context-aware `Transform`, time-based fading (`Store.Fade`, `Fader`, `Fact.FadedAt`) (implemented; specs amended: knowledge, spreading-and-inference, config, overview)
+- [plan: stage 1](plans/plan-stage-1.md): per-phase implementation plan and requirement traceability for Stage 1
 - [stage 2](specs/prd-stage2-less-glue-code.md): `spread.Typed`/`TypedTransform`, attribute conditions, discriminator from data, `declare.ArgNames`
 - [stage 3](specs/prd-stage3-docs-and-patterns.md): recipes, data-file hygiene, second-consumer task (gated)
 - [stage 4](specs/prd-stage4-scale-and-persistence.md): benchmarks, internal indexing, round-trip contract

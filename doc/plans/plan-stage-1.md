@@ -1,6 +1,6 @@
 # Plan: Stage 1, richer rumour behaviour
 
-**Status: Proposed.** Sequences [prd-stage1-richer-rumour-behaviour](../specs/prd-stage1-richer-rumour-behaviour.md) (roadmap Stage 1) into 5 phases. Built against `doc/rules/architecture.md` (no domain vocabulary, no magic numbers, abstract time, injected policy, "Idiomatic Go" section), `doc/rules/testing.md` (stdlib `testing`, table-driven, `go test -race`, `go vet`, defaults-tested-and-overridable) and `doc/rules/specs.md` (spec before code; specs updated in the same change as code). No `doc/plans/` format convention existed; this file uses the generic plan template. A plan decides nothing: every behavioural choice below is the PRD's (R-numbers cite it); the "Decisions" section lists only the small sequencing and implementation calls this plan makes itself.
+**Status: Implemented.** Sequences [prd-stage1-richer-rumour-behaviour](../specs/prd-stage1-richer-rumour-behaviour.md) (roadmap Stage 1) into 5 phases. Built against `doc/rules/architecture.md` (no domain vocabulary, no magic numbers, abstract time, injected policy, "Idiomatic Go" section), `doc/rules/testing.md` (stdlib `testing`, table-driven, `go test -race`, `go vet`, defaults-tested-and-overridable) and `doc/rules/specs.md` (spec before code; specs updated in the same change as code). No `doc/plans/` format convention existed; this file uses the generic plan template. A plan decides nothing: every behavioural choice below is the PRD's (R-numbers cite it); the "Decisions" section lists only the small sequencing and implementation calls this plan makes itself.
 
 Verified against the code at commit 56563d2: `spread/spread.go` (`Spreader.Transform func(knowledge.Fact) knowledge.Fact`, `delivered()` at line ~226), `knowledge/{store,fact,config}.go`, `declare/document.go` (strict decode, `Load`), `justfile` (`test`, `test-race`, `lint`).
 
@@ -115,7 +115,7 @@ Unit: table-driven, one package, injected tick values, no RNG needed (neither fe
 
 - `knowledge/config.go`: `type FadeConfig struct { HalfLives map[string]int64 \`json:"half_lives" yaml:"half_lives"\`; DefaultHalfLife int64 \`json:"default_half_life" yaml:"default_half_life"\`; ForgetBelow float64 \`json:"forget_below" yaml:"forget_below"\` }` (field docs state units, defaults and the P-D5 reading); `Config.Fade FadeConfig \`json:"fade" yaml:"fade"\``; `DefaultConfig()` returns `Fade{HalfLives: map[string]int64{}}` (fresh each call, R22, R25, P-D9); `Validate` adds four joined `ErrInvalidConfig` checks: negative half-life, negative `DefaultHalfLife`, empty `HalfLives` key, `ForgetBelow` outside `[0,1]` or NaN (R24). Zero `Config{}` stays valid.
 - `knowledge/fade.go`: unexported `exponentialFader(cfg FadeConfig) Fader` returning nil when `HalfLives` has no positive entry and `DefaultHalfLife == 0` (so R17 holds: no fader, `Fade` is a no-op). Curve: `confidence * math.Pow(0.5, float64(elapsed)/float64(h))`, `h` per P-D5; never fades when `h == 0` (R21). `NewStore`: clone `HalfLives` (P-D7), apply options, then `if s.fader == nil { s.fader = exponentialFader(s.cfg.Fade) }` (R18).
-- Tests (S12, S13), `knowledge/config_test.go` and `knowledge/fade_test.go`: the PRD's harbour numbers (`overheard` 0.8, half-life 100, `ForgetBelow 0.15`: 0.4 at 100, 0.2 at 200, forgotten at 300 since 0.1 < 0.15; `witnessed` unchanged) within `1e-9` (P-D10); composition: `Fade(100)` then `Fade(200)` equals one `Fade(200)` on a clone (R11); `HalfLives` entry `0` exempts a source under a non-zero `DefaultHalfLife` and `DefaultHalfLife` applies to unlisted sources (P-D5); `Validate` table, one row per R24 case plus a multi-error row proving errors are joined and `errors.Is(err, ErrInvalidConfig)`; `DefaultConfig()` values match R22, two calls return distinct `HalfLives` maps, mutating the caller's map after `NewStore` does not change fading (P-D7); testing rule 4: each default is asserted and an override changes `Fade` behaviour; `WithFader` overrides the config-built policy; `ForgetBelow` alone with no fader changes nothing (P-D4); extreme `h` and huge `elapsed` give a finite confidence in `[0,1]`.
+- Tests (S12, S13, R11 composition), `knowledge/config_test.go` and `knowledge/fade_test.go`: the PRD's harbour numbers (`overheard` 0.8, half-life 100, `ForgetBelow 0.15`: 0.4 at 100, 0.2 at 200, forgotten at 300 since 0.1 < 0.15; `witnessed` unchanged) within `1e-9` (P-D10); composition: `Fade(100)` then `Fade(200)` equals one `Fade(200)` on a clone (R11); `HalfLives` entry `0` exempts a source under a non-zero `DefaultHalfLife` and `DefaultHalfLife` applies to unlisted sources (P-D5); `Validate` table, one row per R24 case plus a multi-error row proving errors are joined and `errors.Is(err, ErrInvalidConfig)`; `DefaultConfig()` values match R22, two calls return distinct `HalfLives` maps, mutating the caller's map after `NewStore` does not change fading (P-D7); testing rule 4: each default is asserted and an override changes `Fade` behaviour; `WithFader` overrides the config-built policy; `ForgetBelow` alone with no fader changes nothing (P-D4); extreme `h` and huge `elapsed` give a finite confidence in `[0,1]`.
 
 **Reuse:** extends `Config`/`DefaultConfig`/`Validate` and the `maps.Clone` pattern already used for `SourceRanks`; no new package or dependency (`math` only).
 
@@ -143,14 +143,42 @@ Unit: table-driven, one package, injected tick values, no RNG needed (neither fe
 
 ---
 
-## Requirement traceability (filled during execution)
+## Requirement traceability
 
-| Requirements | Phase | Test(s) |
+Every PRD requirement maps to the exact test or example function (or, for documentation requirements, the doc artefact and guard test) that covers it. Paths: `S` = `spread/spread_test.go`, `SE` = `spread/example_test.go`, `K` = `knowledge/fade_test.go`, `KC` = `knowledge/config_test.go`, `KE` = `knowledge/example_test.go`, `D` = `declare/fade_test.go`. This table is intended for the PR description.
+
+| Req | Phase | Covered by |
 | --- | --- | --- |
-| R1-R7 | 2 | S1-S5 tests in `spread/spread_test.go`, `Example_transformContext` |
-| R8-R19 | 3 | `knowledge/fade_test.go` (S6-S11, determinism, round trip) |
-| R20-R26 | 4 | `knowledge/config_test.go`, `knowledge/fade_test.go` (S12, S13) |
-| R23, R27, R28 | 5 | `declare` S14 test, docs/guard tests, README/spec review |
+| R1 | 2 | `TestTransformGetsTheFilterEncounter` (S), `TestTransformUsesContext` (S, S1-S3), `Example_transformContext` (SE) |
+| R2 | 2 | `TestTransformEncounterFactIsUndecayed` (S), `TestTransformSeesDecayedCopy` (S) |
+| R3 | 2 | `TestTransformCallCount` (S), `TestTransformRunsBeforeMinConfidenceCheck` (S), `TestTransformPipeline` (S), `TestTransform` (S) |
+| R4 | 2, 3 | `TestTransform` (S), `TestTransformPipeline` (S), `TestTransformCannotChangeDiscriminatorOrFadedAt` (S), `TestDeliveredResetsFadedAt` (S), `TestTransformResultClampAndNaN` (S) |
+| R5 | 2 | `TestTransformPipeline` (S, "nil unchanged"), `TestTransform` (S, "nil transform is the identity") |
+| R6 | 2 | compile-time: `TestTransformUsesContext` and `TestTransform` (S) declare fields of type `spread.Transform`; `TestExportedIdentifiersAreDocumented` |
+| R7 | 2 | `TestTransformLeavesTellerUntouched` (S); read-only rule documented on the `spread.Transform` doc comment |
+| R8 | 3 | `TestFadeOrderAndChanged` (K, S6) |
+| R9 | 3 | `TestFadeElapsedBounds` (K), `TestFadePrivatePassedAndFaded` (K), `TestFadeFaderGetsCopy` (K), `TestFadeElapsedSaturatesOnRealOverflow` (K) |
+| R10 | 3 | `TestFadeComposition` (K, S7), `TestFadeOnlyConfidenceAndFadedAtChange` (K), `TestFadeNeverRewindsFadedAt` (K) |
+| R11 | 3, 4 | `TestFadeComposition` (K), `TestBuiltinFadeComposes` (K) |
+| R12 | 3 | `TestFadeForgets` (K, S9), `TestFadeClampAndUnchanged` (K, clamp decides forgetting) |
+| R13 | 3 | `TestFadeNaNAndClamp` (K, S10), `TestFadeClampAndUnchanged` (K, lower and upper clamp) |
+| R14 | 3 | `TestFadeOnlyConfidenceAndFadedAtChange` (K) |
+| R15 | 3 | `TestFadeSkipsExpired` (K, S8) |
+| R16 | 3 | `TestFadeOrderAndChanged` (K), `TestFadeForgets` (K), `TestFadeClampAndUnchanged` (K, unchanged survivor excluded), `TestFadeDeterministicAndRoundTrip` (K) |
+| R17 | 3, 4 | `TestFadeNoFader` (K, S11), `TestForgetBelowAloneChangesNothing` (K), `TestExponentialFaderNilWhenNoPositiveHalfLife` (K), `TestFadeEmptyStore` (K) |
+| R18 | 3, 4 | `TestWithFaderOverridesConfig` (K), `TestFadeNoFader` (K, `WithFader(nil)` ignored), `TestWithFaderNilKeepsEarlierFader` (K) |
+| R19 | 3 | doc comments on `knowledge.Fader`, `knowledge.WithFader`, `(*Store).Fade`; `doc/specs/knowledge.md` section 5; `TestFadeFaderGetsCopy` (K) for the copy half; `TestExportedIdentifiersAreDocumented` |
+| R20 | 4 | `TestFadeConfigTags` (KC), `TestBuiltinExponentialFade` (K, S12), `TestLoadFadeConfigDrivesFade` (D) |
+| R21 | 4 | `TestBuiltinExponentialFade` (K, S12), `TestFadeHalfLifeSelection` (K), `TestBuiltinFadeExtremes` (K) |
+| R22 | 4 | `TestDefaultConfigValues` (KC), `TestFadeConfigOverrides` (K, testing rule 4), `TestLoadFadeErrorsAndDefaults` (D) |
+| R23 | 5 | `TestLoadFadeConfigDrivesFade` (D, S14), `TestLoadFadeErrorsAndDefaults` (D, typo key fails), `TestFadeConfigTags` (KC) |
+| R24 | 4 | `TestConfigValidate` (KC, S13 table), `TestValidateReportsEveryProblem` (KC, joined), `TestLoadFadeErrorsAndDefaults` (D) |
+| R25 | 4 | `TestStoreClonesHalfLives` (K), `TestDefaultFadeHalfLivesAreFresh` (D), `TestZeroConfigWorks` (KC) |
+| R26 | 3, 5 | `ExampleStore_Fade` (KE, custom curve via `WithFader`), `Example_fadeConfig` (KE, built-in exponential) |
+| R27 | 5 | spec sections `doc/specs/spreading-and-inference.md` A2, A4, A6, A7, A8 and `doc/specs/knowledge.md` sections 2-7; `CHANGELOG.md` `[Unreleased]`; README Fade/Transform snippet, compiled twins `Example_transformContext` (SE) and `Example_fadeConfig` (KE); `TestNoDomainVocabulary` scans the `.md` files |
+| R28 | 5 | doc comments (concurrency statements) on `spread.Transform`, `knowledge.Fader`, `FadeResult`, `WithFader`, `(*Store).Fade`, `FadeConfig`; guards `TestExportedIdentifiersAreDocumented`, `TestNoDomainVocabulary`, `TestImportBoundaries` |
+
+Scenario numbering follows the PRD: S1-S5 in `TestTransformUsesContext`/`TestTransformPipeline`, S6-S11 and S12 in `knowledge/fade_test.go`, S13 is the `TestConfigValidate` table, S14 is `TestLoadFadeConfigDrivesFade`. Composition of the built-in curve (R11) has no PRD scenario number and is labelled R11.
 
 ## Security review
 

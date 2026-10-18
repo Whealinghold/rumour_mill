@@ -91,6 +91,37 @@ engine, _ := infer.New(infer.DefaultConfig(), []infer.Rule{{
 engine.Run(broker.kb, now) // derives the conclusion once; running again changes nothing
 ```
 
+One optional `Transform` hook sees the teller, listener, tick and the teller's own copy, so distortion can depend on who is talking, to whom, and how old the news is. Fading is a step you call: `store.Fade(now)` lowers confidence by a policy (an exponential half-life per source kind from config, or your own `knowledge.Fader`), and forgets facts that fall below `forget_below`. It is off unless configured; the library has no clock.
+
+```go
+sp, _ := spread.New(spread.DefaultConfig())
+sp.Transform = func(e spread.Encounter, d knowledge.Fact) knowledge.Fact {
+	if e.Teller.ID() == "gossip-bram" { // who is talking
+		d.Confidence += 0.1
+	}
+	if e.Listener.ID() == "sceptic-ola" { // to whom
+		d.Confidence /= 2
+	}
+	if e.Now-e.Fact.Observed > 50 { // how old the news is
+		d.Confidence /= 2
+	}
+	return d
+}
+
+cfg := knowledge.DefaultConfig()
+cfg.Fade = knowledge.FadeConfig{HalfLives: map[string]int64{"overheard": 100}, ForgetBelow: 0.15}
+store, _ := knowledge.NewStore(cfg)
+store.Add(knowledge.Fact{ID: "salt", Type: "price_rumour", Subject: "salt", Confidence: 0.8, Source: "overheard"})
+store.Add(knowledge.Fact{ID: "rope", Type: "price_rumour", Subject: "rope", Confidence: 0.8, Source: "witnessed"})
+for _, now := range []knowledge.Tick{100, 200, 300} {
+	res := store.Fade(now) // res.Changed and res.Forgotten list fact IDs
+	salt, _ := store.Get("salt")
+	fmt.Printf("%d changed: %v forgotten: %v salt: %.2f\n", now, res.Changed, res.Forgotten, salt.Confidence)
+}
+```
+
+Compiled twins: the `Transform` body above is the same as in `Example_transformContext` in [`spread/example_test.go`](spread/example_test.go), and the `Fade` body is the same as in `Example_fadeConfig` in [`knowledge/example_test.go`](knowledge/example_test.go) (which wraps it in a helper; `ExampleStore_Fade` there shows a custom `Fader`). The `salt` rumour reads 0.40, 0.20, then is forgotten at tick 300 (0.10 < 0.15); the witnessed `rope` never fades.
+
 Runnable examples in three domains: [`spread/example_test.go`](spread/example_test.go), [`infer/example_test.go`](infer/example_test.go).
 
 ### Declarative loading

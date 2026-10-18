@@ -70,7 +70,7 @@ eng, _ := infer.New(cfg.Infer, doc.Inference)
 ## 3. Loading semantics
 
 - **Overlay.** `Load` decodes into a `Document` whose `Config` was pre-filled with `DefaultConfig()`: a field present in the file replaces the default, an absent one keeps it, and an explicit zero (`max_hops: 0`) is distinguishable from omission.
-- **Maps replace.** `knowledge.source_ranks`, if present, replaces the default map entirely.
+- **Maps replace.** `knowledge.source_ranks`, if present, replaces the default map entirely. `knowledge.fade.half_lives` follows the same decoding, but its default is an empty map, so merging into it and replacing it give the same result and `declare` needs no special case. Fading stays off until a half-life is set (`forget_below` alone does nothing).
 - **Embedded section.** `declare.RulesConfig` embeds `rules.Config` (`json:",inline" yaml:",inline"`), so `on_action_error` and `default_priority` sit side by side under `rules:`. Unknown keys are rejected there too.
 - **Decoders.** A nil `Decoder` means `JSONDecoder`, which also rejects trailing data after the document. A custom decoder starts from the defaults like any other.- **Unknown keys are errors** (`DisallowUnknownFields` in `JSONDecoder`, `KnownFields(true)` in the YAML example). A misspelt tunable fails loudly.
 - **Version.** `version` is required and must be `1`, else `ErrUnsupportedVersion`.
@@ -97,6 +97,9 @@ Every numeric or behavioural default. Per `doc/rules/testing.md` rule 4, each ro
 | `knowledge.unranked_rank` | int | `0` | knowledge | config test |
 | `knowledge.query_floor` | float [0,1] | `0.2` | knowledge | spaceport example, config test |
 | `knowledge.max_facts` | int ≥0 (0 = unlimited) | `0` | knowledge | office example |
+| `knowledge.fade.half_lives` | map string→int ≥0 (ticks, keyed by `Fact.Source`; 0 = that source never fades) | `{}` (empty, non-nil) | [knowledge](knowledge.md) | `knowledge/config_test.go` (default and fresh-map asserts), `knowledge/fade_test.go` (override changes `Fade`; `0` entry exempts a source), `declare` fade integration test (S14) |
+| `knowledge.fade.default_half_life` | int ≥0 (ticks; 0 = unlisted sources never fade) | `0` | knowledge | `knowledge/config_test.go`, `knowledge/fade_test.go` (applies to unlisted sources) |
+| `knowledge.fade.forget_below` | float [0,1] | `0` | knowledge | `knowledge/config_test.go`, `knowledge/fade_test.go` (harbour numbers: forgotten at 0.1 < 0.15; no fader means no effect) |
 | `rules.default_priority` | int | `100` | [declarative](declarative.md) (loader only) | declarative tests |
 | `rules.on_action_error` | `continue` \| `stop` (empty = `continue`) | `continue` | [rules](rules.md) | noir example, rules tests |
 | `spread.decay_factor` | float (0,1] | `0.8` | [spreading](spreading-and-inference.md) | both spread examples |
@@ -164,6 +167,9 @@ config:
   knowledge:
     source_ranks: { witnessed: 3, customs_notice: 3, hearsay: 2, deduced: 1 }
     query_floor: 0.25
+    fade:
+      half_lives: { hearsay: 100 }  # witnessed never fades
+      forget_below: 0.15
   spread:
     received_kind: hearsay
   infer:
@@ -192,7 +198,7 @@ inference:
 {
   "version": 1,
   "config": {
-    "knowledge": { "source_ranks": { "announcement": 3, "overheard": 2, "grapevine": 2, "guess": 1 }, "max_facts": 40 },
+    "knowledge": { "source_ranks": { "announcement": 3, "overheard": 2, "grapevine": 2, "guess": 1 }, "max_facts": 40, "fade": { "half_lives": { "overheard": 100, "grapevine": 100 }, "default_half_life": 0, "forget_below": 0.15 } },
     "spread": { "decay_factor": 0.9, "max_hops": 4, "received_kind": "grapevine" },
     "infer": { "derived_kind": "guess", "max_passes": 2 }
   },
