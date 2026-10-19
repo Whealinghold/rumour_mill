@@ -66,11 +66,12 @@ func (o Outcome) String() string {
 	return "unknown"
 }
 
-// AddResult reports the effect of Add.
+// AddResult reports the effect of Add. It is a plain value, safe from any goroutine once returned.
 type AddResult struct {
 	ID      string
 	Outcome Outcome
 	Evicted []string // IDs removed to honour Config.MaxFacts, in eviction order
+	Size    int      // Len() after cap enforcement; 0 when Add failed
 }
 
 // Decision is a MergePolicy's verdict.

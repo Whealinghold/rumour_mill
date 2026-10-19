@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "config": {
+    "knowledge": { "source_ranks": { "announcement": 3, "grapevine": 2, "derived": 1 } },
+    "spread": { "decay_factor": 0.9, "max_hops": 3, "received_kind": "grapevine" }
+  },
+  "rules": [
+    {
+      "id": "finance-hears-first", "layer": "company", "event": "budget_meeting",
+      "when": { "use": "attr_equals", "args": { "side": "entity", "key": "dept", "value": "finance" } },
+      "do": [ { "use": "add_fact", "args": { "type": "budget_cut", "confidence": 0.9, "source": "announcement" } } ]
+    }
+  ],
+  "spreading": {
+    "filters": [
+      { "use": "not", "of": [ { "use": "attr_same", "args": { "side": "teller", "other_side": "listener", "key": "dept" } } ] }
+    ]
+  }
+}

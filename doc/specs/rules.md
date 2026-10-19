@@ -67,12 +67,66 @@ func NewRegistry[C any](cfg Config, layers ...Layer[C]) (*Registry[C], error)
 func (r *Registry[C]) Register(layer, scope string, rule Rule[C]) error
 func (r *Registry[C]) Unregister(layer, scope, ruleID string) bool
 func (r *Registry[C]) Process(ctx C, eventType string) (Result, error)
+func (r *Registry[C]) Observe(h Hooks)           // chained; safe at any time; applies from the next Process
+func (r *Registry[C]) SetLogger(l *slog.Logger)  // nil ignored; default discards
+func (r *Registry[C]) SetClock(now func() time.Time) // enables Hooks.OnProcessDone; nil clears it (default: no timing)
+func (r *Registry[C]) Layers() []string          // layer names in registration order; a fresh slice
+func (r *Registry[C]) RuleCount(layer string) int // rules registered in layer across all scopes; 0 for an unknown layer
+
+type Hooks struct {
+    OnProcess     func(Result, error)       // once per Process, at the end
+    OnProcessDone func(time.Duration)       // after OnProcess; only when SetClock was given
+    OnRegister    func(RegisterEvent)       // after every Register call, successful or not
+    OnUnregister  func(UnregisterEvent)     // after every Unregister call
+}
+
+// RegisterEvent describes one Register call. Count is the number of rules in
+// Layer after the call (0 when the layer is unknown). Err is the error Register
+// returned, nil on success; classify it with errors.Is against ErrDuplicateRule,
+// ErrInvalidRule and ErrUnknownLayer.
+type RegisterEvent struct {
+    Layer, Scope, RuleID string
+    Count                int
+    Err                  error
+}
+
+// UnregisterEvent describes one Unregister call. Removed is its return value;
+// Count is the number of rules in Layer after the call.
+type UnregisterEvent struct {
+    Layer, Scope, RuleID string
+    Removed              bool
+    Count                int
+}
 
 type Result struct {
-    Fired   []Fired  // in execution order
-    Stopped StopMode // StopAll if Process ended early, else StopLayer if some layer was cut short, else StopNone
+    Fired   []Fired      // in execution order
+    Stopped StopMode     // StopAll if Process ended early, else StopLayer if some layer was cut short, else StopNone
+    Layers  []LayerStats // one entry per layer Process reached, in layer order
 }
-type Fired struct{ Layer, Scope, RuleID string }
+
+// Fired identifies a rule that fired. Failed is true when its Do returned an error.
+type Fired struct {
+    Layer, Scope, RuleID string
+    Failed               bool
+}
+
+// LayerStats are the diagnostics of one layer in one Process call. Every count
+// is a number of rules, never of scopes or events, so cardinality is bounded by
+// the number of layers.
+type LayerStats struct {
+    Layer      string
+    Candidates int // rules registered for the event type under the context's scope keys: the list the layer would walk
+    Skipped    int // candidates whose When returned false
+    Failed     int // fired candidates whose Do returned an error
+}
+
+// Unmatched reports whether no layer had any candidate rule for the event type,
+// the signature of a typo'd or never-registered event type. It is true when
+// Layers is empty (a registry without layers has no candidates either).
+func (r Result) Unmatched() bool
+```
+
+`Candidates - Skipped - (fired in this layer)` is the number of candidates never reached because a `Stop` ended the layer or `Process` early. `Layers` has an entry for the layer being walked when `StopAll` or the `stop` error mode ends `Process`, and none for later layers; a layer with no candidates still has an entry (all zeros but the name). The `Layers` slice is freshly allocated per call and owned by the caller.
 
 var ErrUnknownLayer, ErrInvalidLayer, ErrInvalidRule, ErrDuplicateRule, ErrInvalidConfig error
 ```
@@ -93,6 +147,24 @@ A layer with a nil `Scopes` has exactly one scope, the empty string (the "univer
    4. `StopLayer` ends this layer's walk; later layers still run. `StopAll` ends `Process`. `Result.Stopped` records which.
 2. A rule whose condition is false never fires and never stops anything.
 3. A `Do` error is joined (`errors.Join`) into the returned error. With `continue` the walk goes on (a rule that fired but errored still applies its `Stop`). With `stop`, `Process` returns right after the failing rule with `Result.Stopped == StopNone`.
+
+**Observability.** `Observe` adds hooks that run in the order given, with no registry lock held, after each `Process` (including the early `stop` return), receiving the `Result` and the returned error; every `Hooks` field is optional and each non-nil field is chained independently. `OnProcessDone(d)` runs after `OnProcess`, only when `SetClock(now)` was given; the clock is read twice per `Process` and never otherwise, and `d` is floored at 0 (duration is not a `Result` field, so `Result`s stay deterministic and comparable). `OnRegister` runs after every `Register` call, including failures (`RegisterEvent.Err` carries the sentinel); `OnUnregister` after every `Unregister` call (`Removed == false` for an unknown rule). Both run after the registry lock is released, with `Count` computed under the lock, as plain synchronous calls on the caller's goroutine. Concurrent `Register` calls may therefore deliver their events out of order; `Count` in each event is still the correct count at that call's moment, and an adapter that wants the current value reads `RuleCount`. `Layers()` and `RuleCount(layer)` let an adapter seed per-layer series at wiring time and read the rule counts already registered (`Layers` is immutable after `NewRegistry`; `RuleCount` takes the read lock). `Register` and `Unregister` each log a Debug line (layer, scope, rule id, ok) through the registry logger; `Unregister` logs ok=false when nothing was removed, and a failed `Register` logs nothing (the error is returned, and `OnRegister` reports it). `SetLogger` logs a Debug summary per `Process` (event type, fired count, the fired rule IDs as `layer/scope/id` strings under `rules`, per-layer `considered`/`skipped`/`failed`, `unmatched`, stopped mode) and a Warn when it returns an error. Both are read-only observers and never change the outcome.
+
+Diagnosing "why did my rule not fire": `Result.Unmatched()` true means no rule is registered for that event type under any of the context's scopes (typo, or rules not loaded; compare `RuleCount`). Otherwise `Layers[i].Candidates > 0` with `Skipped == Candidates` means every candidate's `When` was false. `Candidates == 0` for one layer means no rule of that layer matches this context's scope keys (the context's `Scopes` returned the wrong keys, or the rules were registered under another scope).
+
+Worked example (neutral domain, an office whose "floor" layer is keyed by department):
+
+```go
+reg, _ := rules.NewRegistry[*Ctx](rules.DefaultConfig(),
+    rules.Layer[*Ctx]{Name: "all"},
+    rules.Layer[*Ctx]{Name: "floor", Scopes: func(c *Ctx) []string { return []string{c.Dept} }})
+reg.Register("all", "", rules.Rule[*Ctx]{ID: "log", Event: "coffee_spilled", Do: logIt})
+reg.Register("floor", "finance", rules.Rule[*Ctx]{ID: "mop", Event: "coffee_spilled", When: isNearby, Do: mopUp})
+res, _ := reg.Process(&Ctx{Dept: "finance"}, "cofee_spilled") // typo
+// res.Unmatched() == true; res.Layers == [{all 0 0 0} {floor 0 0 0}]
+res, _ = reg.Process(&Ctx{Dept: "finance", Near: false}, "coffee_spilled")
+// res.Fired == [{all "" log false}]; res.Layers == [{all 1 0 0} {floor 1 1 0}]: "mop" was considered, skipped (isNearby false)
+```
 
 Rule lists are snapshotted under the read lock before caller code runs, so a condition or action may call `Register`/`Unregister` without deadlock; the change applies from the next `Process`. No rules for the event type is not an error.
 

@@ -62,6 +62,7 @@ type Transfer struct {
     To         string
     Confidence float64           // as delivered
     Outcome    knowledge.Outcome // what the listener's store did with it
+    Hops       int               // Prov.Hops of the delivered copy (the teller's hops + 1)
 }
 // Dropped counts offers that did not become a delivery, by reason.
 type Dropped struct {
@@ -71,16 +72,95 @@ type Dropped struct {
     TransformDropped   int // Transform returned a NaN confidence
 }
 
+// Withheld counts FACTS (not fact-listener pairs) the teller held that were not
+// offered at all, by reason. Not part of Offered or Dropped. Each fact is
+// counted under exactly one reason, the first that applies in this order:
+// expired, below_source_confidence, private, max_hops.
+type Withheld struct {
+    Private               int // unexpired, at or above MinSourceConfidence, and Private (also at MaxHops still counts here)
+    MaxHops               int // unexpired, at or above MinSourceConfidence, not Private, and at Config.MaxHops
+    BelowSourceConfidence int // unexpired, but under MinSourceConfidence (whether or not Private or at MaxHops)
+    Expired               int // Expiry <= now, whatever else is true of the fact; dead facts awaiting Prune count on every call
+}
+// "private", "max_hops", "below_source_confidence", "expired", zero counts included
+func (w Withheld) Each(f func(reason string, n int))
+
+// SkippedListeners counts listeners passed to Spread that were skipped without
+// any offer. The teller appearing in its own listener list is skipped silently
+// and counted nowhere.
+type SkippedListeners struct {
+    Nil     int // a nil Holder in the listeners slice
+    NoStore int // a listener whose Knowledge() is nil: it cannot receive
+}
+// "nil_listener" then "no_store", zero counts included
+func (k SkippedListeners) Each(f func(reason string, n int))
+
 // Offered counts every (fact, listener) pair considered, so
-// Offered == len(Transfers) + sum(Dropped) + store errors.
+// Offered == len(Transfers) + sum(Dropped) + store errors (unchanged by Withheld).
 type Result struct {
     Transfers []Transfer
     Offered   int
     Dropped   Dropped
+    HolderMismatches int // Typed filter / TypedTransform met a holder of the wrong type
+    Withheld  Withheld // facts the teller held but never offered
+    SkippedListeners SkippedListeners // listeners skipped without any offer (nil, or no store)
 }
+
+type Hooks struct {
+    OnSpread     func(Result, error)    // result plus joined store errors; once per Spread that ran
+    OnSkip       func(reason string)    // a Spread that returned early: SkipNilTeller or SkipNoStore; OnSpread does NOT run
+    OnSpreadDone func(time.Duration)    // after OnSpread; only when WithClock was given
+}
+const (
+    SkipNilTeller = "nil_teller" // teller is nil
+    SkipNoStore   = "no_store"   // teller.Knowledge() is nil
+)
+func SkipReasons() []string              // fresh slice: SkipNilTeller, SkipNoStore; adapters seed from it
+func WithHooks(h Hooks) Option           // repeatable; each non-nil field chained independently, in the order given
+func WithLogger(l *slog.Logger) Option   // nil ignored; default discards
+func WithClock(now func() time.Time) Option // enables OnSpreadDone; nil ignored; default none = no timing, no overhead
 ```
 
-Filters are ordinary `logic.Condition`s over `Encounter`, written in Go or built from data (see [declarative](declarative.md)), and composable with `logic.All/Any/Not`. A filter needing the caller's concrete types type-asserts `e.Teller`/`e.Listener`.
+Neutral example (office gossip). Alice tells three colleagues; one slot in the slice is nil and one colleague has no store:
+
+```go
+res, _ := sp.Spread(alice, []spread.Holder{bob, nil, carol, desklessTemp}, now)
+// res.SkippedListeners == {Nil: 1, NoStore: 1}; Offered counts only bob and carol.
+// A fact alice holds at confidence 0.2 (MinSourceConfidence 0.3) shows up as res.Withheld.BelowSourceConfidence == 1.
+// A Transfer for bob now carries Hops: 2 when alice herself had heard it at 1 hop.
+res, _ = sp.Spread(nil, listeners, now) // OnSkip(SkipNilTeller); OnSpread does not run; zero Result returned as before
+```
+
+**Observability.** `spread.WithHooks(Hooks{OnSpread func(Result, error)})` is called once per `Spread` with the `Result` and the joined store errors (nil when none); `spread.WithLogger(*slog.Logger)` logs one Debug summary per call and, when `Result.HolderMismatches > 0`, one Warn per call (default logger discards). `Result.HolderMismatches` counts how often a `Typed` filter or `TypedTransform` met a teller or listener of the wrong type during the call (a mismatched filter is also counted in `Dropped.Filtered`, since that wiring bug otherwise reads as policy; a mismatched transform passes the delivery through). `spread.OnMismatch(func(Encounter))` is the per-call `TypedOption` for the same event. `WithHooks` and `OnMismatch` are repeatable and chain in order, nil ignored. `Dropped.Each(func(reason string, n int))` visits every drop reason, so adapters need not list the fields. `Result.Withheld` counts facts (not pairs) the teller held that were not offered at all, each under exactly one reason (first match of: expired, below `MinSourceConfidence`, `Private`, reached `MaxHops`); they are in none of `Offered`, `Dropped` or the identity `Offered == len(Transfers) + Dropped total + store errors`, which is unchanged. `Withheld.Each` visits `private`, `max_hops`, `below_source_confidence`, `expired` in that order, zero counts included. To classify expiry and the source-confidence floor, `Spread` reads the teller's facts with `All()` and applies the same expiry (`Expiry != nil && *Expiry <= now`) and floor rules as `Find`; the offered set and its order are unchanged. `Result.SkippedListeners` counts nil listeners and listeners with no store (`Each` visits `nil_listener` then `no_store`) and `Spread` logs one Warn per call when either is non-zero; the teller in its own listener list stays a silent, uncounted skip. `Transfer.Hops` is the delivered copy's `Prov.Hops`. A nil teller or a teller with nil `Knowledge()` still returns early with a zero `Result` and WITHOUT calling `OnSpread` (there is no `Result` to report), but now calls `OnSkip(SkipNilTeller)` or `OnSkip(SkipNoStore)` (and still logs its Warn). `WithClock(now)` enables timing: `now` is read at the start of `Spread` (after the early-return checks) and again just before `OnSpread`, and `OnSpreadDone(d)` runs after `OnSpread` with `d` floored at 0; with no clock it is never called and the clock is never read. Durations are not a `Result` field, so `Result`s stay deterministic and comparable. The skip path calls neither `OnSpread` nor `OnSpreadDone`. Beyond the Debug summary (now including withheld and skipped listeners), `Spread` logs one Warn per call when there were store errors (teller, error count), one when `Dropped.TransformDropped > 0`, one when `SkippedListeners` is non-zero, and one for a nil teller or a teller with nil `Knowledge()`. Adds are observed at the store (`knowledge.WithHooks`). Ready-made Prometheus and OpenTelemetry adapters live in separate modules under `contrib/`. Hooks are synchronous, read-only and must not change the outcome; nil means no-op.
+
+Filters are ordinary `logic.Condition`s over `Encounter`, written in Go or built from data (see [declarative](declarative.md)), and composable with `logic.All/Any/Not`. A filter needing the caller's concrete types wraps it in `spread.Typed` (below), which asserts `e.Teller`/`e.Listener` once, so the filter body works in terms of the caller's own holder type.
+
+```go
+// TypedEncounter is Encounter with the caller's holder type H in place of Holder.
+type TypedEncounter[H Holder] struct {
+    Teller, Listener H
+    Fact             knowledge.Fact
+    Now              knowledge.Tick
+}
+
+// Typed adapts f into an Encounter filter. If the teller or listener is not an H
+// (including a nil Holder) the encounter is blocked and f is not called. A nil f
+// returns a nil condition, which WithFilter ignores. H may be a pointer or an
+// interface type. No state is held; concurrency is that of f.
+func Typed[H Holder](f func(TypedEncounter[H]) bool, opts ...TypedOption) logic.Condition[Encounter]
+
+// TypedTransform adapts f into a Transform. TypedEncounter.Fact is the teller's
+// fact before decay; delivered is the copy about to be delivered. If the teller
+// or listener is not an H (including nil) f is not called and delivered is
+// returned unchanged. A nil f returns nil, leaving Spreader.Transform unset. The
+// fixed-field restore above still applies to what f returns.
+func TypedTransform[H Holder](f func(TypedEncounter[H], knowledge.Fact) knowledge.Fact, opts ...TypedOption) func(Encounter, knowledge.Fact) knowledge.Fact
+
+// TypedOption configures Typed and TypedTransform; OnMismatch is its only option.
+type TypedOption func(*typedOpts)
+// OnMismatch calls f when a holder is not an H, before blocking or passing through.
+func OnMismatch(f func(Encounter)) TypedOption
+```
 
 ## A3. Config
 
@@ -108,22 +188,22 @@ func (c Config) Validate() error
 
 ## A4. Behaviour: `Spread(teller, listeners, now)`
 
-1. If `teller.Knowledge()` is nil, return an empty result.
-2. Candidate facts: `Find` on the teller's store with `MinConfidence = MinSourceConfidence` at `now` (unexpired); drop `Private` facts; drop facts with `MaxHops > 0 && Prov.Hops >= MaxHops`. Privacy is intrinsic and cannot be disabled by filters or config. Order: confidence descending, then ascending ID.
-3. For each listener in the order given (skip one whose ID equals the teller's or whose `Knowledge()` is nil), for each candidate:
+1. If the teller is nil or `teller.Knowledge()` is nil, call `OnSkip` with `SkipNilTeller` or `SkipNoStore`, log a Warn and return an empty result (no `OnSpread`).
+2. Candidate facts: every fact of the teller's store (`All()`) at `now`, classified in this order: expired (count `Withheld.Expired`); confidence `< MinSourceConfidence` (count `Withheld.BelowSourceConfidence`); `Private` (count `Withheld.Private`); `MaxHops > 0 && Prov.Hops >= MaxHops` (count `Withheld.MaxHops`); anything else is a candidate. Privacy is intrinsic and cannot be disabled by filters or config. Order: confidence descending, then ascending ID.
+3. For each listener in the order given (a nil one counts `SkippedListeners.Nil`; one whose ID equals the teller's is skipped silently; one whose `Knowledge()` is nil counts `SkippedListeners.NoStore`), for each candidate:
    1. If `SkipBackToSource` and `Prov.From == listener.ID()`, skip.
    2. Run the filters on the `Encounter`, in the order added, short-circuiting; any `false` skips.
    3. Build the copy: same `ID`, `Type`, `Subject`, `Discriminator`, `Payload`, `Expiry`; `Confidence = fact.Confidence × DecayFactor`; `Source = ReceivedKind`; `Observed = now`; `Prov = {From: teller.ID(), Hops: fact.Prov.Hops+1, EventID: fact.Prov.EventID}` (premises not forwarded); `Private = false`.
    4. Apply `Transform` if set, passing the same `Encounter` the filters judged (built once per listener and fact) and the copy from step 3; then restore the fixed fields (see A2), clamp confidence to `[0,1]`. Position is unchanged: after the copy is built, before the `MinConfidence` check. The teller's store and the `Encounter` are not modified on the transform's behalf. The copy's `FadedAt` is reset to zero: the listener acquired the fact at `now`, so the teller's settle point does not carry over.
    5. If confidence `< MinConfidence`, skip.
-   6. `listener.Knowledge().Add(copy)`; record a `Transfer` with the store's outcome. Normal merge rules apply, so a listener holding a better-ranked or stronger version is unaffected (`Rejected`).
+   6. `listener.Knowledge().Add(copy)`; record a `Transfer` (with `Hops` = the copy's `Prov.Hops`) with the store's outcome. Normal merge rules apply, so a listener holding a better-ranked or stronger version is unaffected (`Rejected`).
 4. The teller's store is never modified.
 
 The teller's facts are read once up front; listener stores are written one at a time. Decay is per hop, not per time.
 
 ## A5. Error cases
 
-`ErrInvalidConfig` from `New`: `DecayFactor` outside `(0,1]`; `MinConfidence` or `MinSourceConfidence` outside `[0,1]`; `MaxHops < 0`; empty `ReceivedKind`. `Spread` returns store errors (joined), for example `knowledge.ErrIdentityMismatch`; listeners already processed keep their facts (not transactional). Nil listeners, the teller itself and holders without a store are skipped. A nil filter is ignored. A transform that returns a NaN confidence drops that delivery; a nil `Transform` behaves as if unset. Panics from caller filters/transform propagate (nothing recovers them, so listeners already processed keep their facts).
+`ErrInvalidConfig` from `New`: `DecayFactor` outside `(0,1]`; `MinConfidence` or `MinSourceConfidence` outside `[0,1]`; `MaxHops < 0`; empty `ReceivedKind`. `Spread` returns store errors (joined), for example `knowledge.ErrIdentityMismatch`; listeners already processed keep their facts (not transactional). Nil listeners, the teller itself and holders without a store are skipped. A nil filter is ignored. With `spread.Typed`, a teller or listener of the wrong type is blocked (counted in `Dropped.Filtered`), not an error, and not a panic. A transform that returns a NaN confidence drops that delivery; a nil `Transform` behaves as if unset. Panics from caller filters/transform propagate (nothing recovers them, so listeners already processed keep their facts).
 
 ## A6. Concurrency and determinism
 
@@ -156,14 +236,14 @@ type Crew struct { id string; kb *knowledge.Store; Guild string; Trust map[strin
 func (c *Crew) ID() string                  { return c.id }
 func (c *Crew) Knowledge() *knowledge.Store { return c.kb }
 
-neverToHaulers := func(e spread.Encounter) bool { // customs staff never pass smuggling intel to the cargo guild
-    t, l := e.Teller.(*Crew), e.Listener.(*Crew)
+neverToHaulers := spread.Typed(func(e spread.TypedEncounter[*Crew]) bool { // customs staff never pass smuggling intel to the cargo guild
+    t, l := e.Teller, e.Listener
     smuggling := e.Fact.Type == "captain_is_smuggler" || e.Fact.Type == "ship_flagged"
     return !(t.Guild == "customs" && l.Guild == "haulers" && smuggling)
-}
-notIfDistrusted := func(e spread.Encounter) bool { // nobody tells someone who distrusts the subject
-    return e.Listener.(*Crew).Trust[e.Fact.Subject] > -50
-}
+})
+notIfDistrusted := spread.Typed(func(e spread.TypedEncounter[*Crew]) bool { // nobody tells someone who distrusts the subject
+    return e.Listener.Trust[e.Fact.Subject] > -50
+})
 cfg := spread.DefaultConfig()
 cfg.ReceivedKind = "hearsay"
 sp, _ := spread.New(cfg, spread.WithFilter(neverToHaulers), spread.WithFilter(notIfDistrusted))
@@ -253,12 +333,26 @@ func DefaultConfig() Config
 func (c Config) Validate() error
 
 type Engine struct{ /* unexported */ }
-func New(cfg Config, rules []Rule) (*Engine, error)
+type Option func(*Engine)
+func New(cfg Config, rules []Rule, opts ...Option) (*Engine, error)
+
+type Hooks struct {
+    OnRun     func(Result, error)   // Result and the error Run returns
+    OnRunDone func(time.Duration)   // after OnRun; only when WithClock was given
+}
+func WithHooks(h Hooks) Option                  // repeatable; each non-nil field chained independently, in the order given
+func WithLogger(l *slog.Logger) Option          // nil ignored; default discards
+func WithClock(now func() time.Time) Option     // enables OnRunDone; nil ignored; default none = no timing, no overhead
 func (e *Engine) Run(store *knowledge.Store, now knowledge.Tick) (Result, error)
 
 type Result struct {
     Derived []knowledge.AddResult // inserted or replaced, in the order produced
     Passes  int                   // passes executed (>= 1)
+    // Truncated is true when Run stopped because it reached MaxPasses AND that
+    // last pass still inserted or replaced something, so a further pass might have
+    // derived more (or a rule cycle keeps replacing facts). Always false when
+    // MaxPasses == 1 (chaining is off by design) and when a pass changed nothing.
+    Truncated bool
 }
 ```
 
@@ -267,6 +361,8 @@ type Result struct {
 | `MaxPasses` | `1` | Maximum passes per `Run`; `1` = one pass, no chaining (reference behaviour). `>1` lets derived facts feed later rules; `Run` stops early when a pass changes nothing. This bounds chaining and any rule cycles. |
 | `IDPrefix` | `"inferred"` | Derived ID is `IDPrefix:ruleID:subject`. |
 | `DerivedKind` | `"derived"` | Source kind stamped on derived facts; must be ranked by the caller. |
+
+**Observability.** `OnRun` runs once at the end of every `Run`, including failed runs and the `ErrNilStore` call (zero `Result`), with the error `Run` returns; exhausting `MaxPasses` is not an error, but `Result.Truncated` reports it (precisely: `MaxPasses > 1`, the pass numbered `MaxPasses` ran, and it inserted or replaced at least one fact; a run that ends because a pass changed nothing, or that fails with a store error, is not truncated). Options chain in the order given; each non-nil `Hooks` field is chained independently. `WithClock(now)` enables timing: `now` is read at the start of `Run` and just before `OnRun`, and `OnRunDone(d)` runs after `OnRun` with `d` floored at 0, for every `Run` including the `ErrNilStore` call; with no clock it never runs and the clock is never read. `Result` carries no duration, so it stays deterministic. `WithLogger` logs a Debug summary per `Run` (passes, derived, truncated, and `by_rule`: a map from rule ID to the number of facts that rule inserted or replaced in this run, rules that derived nothing omitted), a Warn when `Run` returns an error, and a Warn when the run was truncated (passes, max_passes, derived). Per-rule counts are a log-only diagnostic (rule IDs are unbounded for metrics) and are not part of `Result`. Facts it derives also reach `knowledge.Hooks.OnAdd` on the store. Hooks are synchronous and read-only.
 
 ## B3. Behaviour: `Run(store, now)`
 
@@ -282,6 +378,8 @@ Rules are immutable after `New`. Each pass:
 3. If a pass inserted or replaced nothing, stop. Otherwise continue to `MaxPasses`.
 
 A fixed-subject product with unbound premises yields the same ID for every candidate; the merge keeps the strongest. A derived fact does not track its premises: if one later expires, the derived fact stays until its own expiry. Use `TTL` if that matters.
+
+Truncation example (office gossip, `MaxPasses = 2`): rules `a: late_report -> missed_deadline`, `b: missed_deadline -> team_stressed`, `c: team_stressed -> overtime_ban`. Pass 1 derives `missed_deadline`, pass 2 derives `team_stressed` and changes the store, and `MaxPasses` is reached, so `Result{Passes: 2, Truncated: true}`: `overtime_ban` is not derived until the next `Run` (or a higher `max_passes`). With `MaxPasses = 3` the third pass derives `overtime_ban`, still changed something, so `Truncated` is true again; `MaxPasses = 4` ends on a pass that changed nothing, `Truncated` false.
 
 ## B4. Error cases
 

@@ -62,6 +62,14 @@ func FuzzNode(f *testing.F) {
 		`{"use":"if","cond":{"use":"even"},"then":{"use":"fail"},"else":{"use":"say","args":{"msg":"x"}}}`,
 		`{"use":"gt","args":{"value":1e400}}`, `{"use":"gt","args":{"value":9223372036854775808}}`, `{"use":"gt","args":{"value":-0.0}}`,
 		`{"use":"say","args":{"msg":null}}`, `{"use":"say","args":null}`, `{"args":{}}`, `{"of":[{"of":[{"of":[]}]}]}`,
+		`{"use":"attr_equals","args":{"side":"self","key":"n","value":1}}`, `{"use":"attr_equals","args":{"side":"self","key":"n","value":"x"}}`,
+		`{"use":"attr_equals","args":{"side":"self","key":"n","value":true}}`, `{"use":"attr_equals","args":{"side":"self","key":"n","value":null}}`,
+		`{"use":"attr_equals","args":{"side":"self","key":"n","value":[1]}}`, `{"use":"attr_equals","args":{"side":"self","key":"n","value":{"a":1}}}`,
+		`{"use":"attr_in","args":{"side":"self","key":"n","values":[]}}`, `{"use":"attr_in","args":{"side":"peer","key":"n","values":[1,"a",null,true,[2]]}}`,
+		`{"use":"attr_same","args":{"side":"self","key":"n"}}`, `{"use":"attr_same","args":{"side":"self","other_side":"peer","key":"n","other_key":"m"}}`,
+		`{"use":"add_fact","args":{"type":"t","confidence":0.5,"source":"x","discriminator_from":"parity"}}`,
+		`{"use":"add_fact","args":{"type":"t","confidence":0.5,"source":"x","discriminator":"d","discriminator_from":"parity"}}`,
+		`{"use":"add_fact","args":{"type":"t","confidence":0.5,"source":"x","discriminator_from":"nope"}}`,
 	} {
 		f.Add([]byte(s))
 	}

@@ -52,6 +52,7 @@ type AddResult struct {
     ID      string
     Outcome Outcome
     Evicted []string // IDs removed to honour Config.MaxFacts, in eviction order
+    Size    int      // facts in the store after this Add (cap enforced); 0 on a failed Add
 }
 
 type Decision int // Keep, Replace
@@ -75,6 +76,14 @@ type FadeResult struct {
     Forgotten []string // IDs removed from the store
     Invalid   []string // IDs whose Fader returned NaN: left unchanged and unsettled
     Examined  int      // unexpired facts the Fader was called on
+    Wired     bool     // a Fader exists. false: Fade was a no-op, Examined is 0 by construction
+    Size      int      // facts in the store after this Fade
+}
+
+// PruneResult reports one Prune call (passed to Hooks.OnPrune; Prune itself still returns the count).
+type PruneResult struct {
+    Removed int // expired facts deleted; may be 0
+    Size    int // facts in the store after this Prune
 }
 
 type Store struct{ /* unexported */ }
@@ -82,7 +91,10 @@ type Store struct{ /* unexported */ }
 func NewStore(cfg Config, opts ...Option) (*Store, error) // validates cfg
 type Option func(*Store)
 func WithMergePolicy(p MergePolicy) Option // default: RankThenConfidence
+func WithHooks(h Hooks) Option             // observers; repeatable, chained in order
+func WithLogger(l *slog.Logger) Option     // nil ignored; default discards
 func WithFader(f Fader) Option             // replaces the config-built fader; nil is ignored; not safe for concurrent use against a shared store
+func WithClock(now func() time.Time) Option // injects a wall clock for Hooks.OnDuration; nil ignored; default none = no timing, no overhead
 
 func (s *Store) Add(f Fact) (AddResult, error)
 func (s *Store) Get(id string) (Fact, bool)                   // raw: ignores floor and expiry
@@ -90,11 +102,49 @@ func (s *Store) Find(q Query, now Tick) []Fact                // unexpired, >= f
 func (s *Store) Prune(now Tick) int                           // deletes expired facts; returns count
 func (s *Store) Fade(now Tick) FadeResult                     // weakens/forgets unexpired facts by the fader; see 3.5
 func (s *Store) All() []Fact                                  // everything, ascending ID; for persistence/debug
+func (s *Store) Len() int                                     // number of facts held, expired and low-confidence included; O(1)
 
 var ErrInvalidFact, ErrIdentityMismatch, ErrInvalidConfig error
 ```
 
 `Find`, `Get` and `All` return copies.
+
+```go
+type Hooks struct {
+    OnAdd    func(f Fact, r AddResult)                // after every successful Add, f.ID == r.ID; r.Size is the store size
+    OnAddError func(f Fact, reason string, err error) // after every Add that returned an error
+    OnFade   func(r FadeResult)                       // end of EVERY Fade, with or without a Fader (r.Wired tells)
+    OnPrune  func(r PruneResult)                      // end of every Prune (Removed == 0 included); r.Size is the store size
+    OnDuration func(op string, d time.Duration)       // only when WithClock was given; after the operation's own hook
+}
+
+// Add error reasons (Hooks.OnAddError) and the operations timed by OnDuration.
+const (
+    AddErrorInvalid          = "invalid"           // wraps ErrInvalidFact
+    AddErrorIdentityMismatch = "identity_mismatch" // wraps ErrIdentityMismatch
+    OpFind  = "find"
+    OpFade  = "fade"
+    OpPrune = "prune"
+)
+func AddErrorReasons() []string // fresh slice: AddErrorInvalid, AddErrorIdentityMismatch; adapters seed from it
+```
+
+**Observability.** `OnAdd` runs after every successful `Add` whoever called it (`add_fact`, a spread delivery, inference), once the cap is enforced; a `Rejected` result still counts as successful. It does not run when `Add` returns an error. `OnAddError` runs for every `Add` that returns an error, once, before `Add` returns, with the incoming fact (a copy, as passed: not normalised), the reason (`AddErrorInvalid` for `ErrInvalidFact`, `AddErrorIdentityMismatch` for `ErrIdentityMismatch`; those are the only two Add errors) and the error; `OnAdd` does not run for it. `OnFade` runs at the end of EVERY `Fade`, including one on a store with no Fader (then `FadeResult{Wired: false, Size: n}` with everything else zero), so an adapter can count fade runs and tell "Fade never called" from "no Fader wired" from "nothing to change". `OnPrune` runs at the end of every `Prune` with a `PruneResult` (`Removed` may be 0). `Size` on `AddResult`, `FadeResult` and `PruneResult` is `Len()` at hook time: stores are not concurrency-safe, so an adapter records the size when told and never polls. `WithClock(now)` enables timing: when a clock is injected, `Find`, `Fade` and `Prune` read it before and after their work and, after their own hook, call `OnDuration(OpFind|OpFade|OpPrune, d)` (`d` floored at 0). `Find` keeps its signature; the hook is a read-only observer, and `Find` includes the calls other packages make. With no clock the clock is never read and `OnDuration` never fires; durations are never fields on `AddResult` or `FadeResult`, so results stay deterministic and comparable. `WithHooks` is repeatable: hooks run in order, nil fields ignored, synchronously on the caller's goroutine; they must not call back into the store and treat arguments as read-only. `WithLogger` logs Warn when an `Add` evicts facts (the ADDED fact's id, outcome, evicted count) and when an `Add` fails, with `ErrIdentityMismatch` ("add identity mismatch": fact id, error) or `ErrInvalidFact` ("add invalid fact": type, source, error; never the payload); a Debug summary per `Fade` (wired, examined, changed, forgotten, invalid, size) plus, once per `Fade`, a Warn when `Invalid` is non-empty (count and up to 5 IDs); and a Debug line per `Prune` (removed, size). A `Fade` on a store with no Fader logs the Debug line with `wired=false`. Observing never changes behaviour.
+
+`Len` is documented as not safe for concurrent use like the rest of the store.
+
+Worked example (neutral domain, a village notice board):
+
+```go
+board, _ := knowledge.NewStore(cfg, knowledge.WithHooks(knowledge.Hooks{
+    OnAdd:      func(f knowledge.Fact, r knowledge.AddResult) { fmt.Println("size", r.Size) },
+    OnAddError: func(f knowledge.Fact, reason string, err error) { fmt.Println("rejected add:", reason) },
+    OnFade:     func(r knowledge.FadeResult) { fmt.Println("fade wired:", r.Wired, "examined:", r.Examined) },
+}))
+board.Add(knowledge.Fact{Type: "notice", Subject: "well", Confidence: 0.8, Source: "posted"}) // size 1
+board.Add(knowledge.Fact{Type: "", Source: "posted"})                                          // rejected add: invalid
+board.Fade(100)                                                                                // fade wired: false examined: 0 (no half-life configured)
+```
 
 ### Config
 
@@ -168,14 +218,14 @@ Expired at `now` when `Expiry != nil && *Expiry <= now`. `Find` never returns ex
 
 `Fade(now)` is a caller-driven maintenance step: the library has no clock or scheduler, the caller calls it at whatever cadence it likes. Fading is opt-in.
 
-1. **No fader, no-op.** The store's fader is the one from `WithFader`, otherwise the exponential fader built from `Config.Fade`. That built-in fader exists only if some `HalfLives` entry is positive or `DefaultHalfLife > 0`. With no fader, `Fade` changes nothing and returns an empty `FadeResult`, even when `ForgetBelow > 0`: forgetting is part of fading and is opt-in too. `WithFader(nil)` is ignored.
+1. **No fader, no-op.** The store's fader is the one from `WithFader`, otherwise the exponential fader built from `Config.Fade`. That built-in fader exists only if some `HalfLives` entry is positive or `DefaultHalfLife > 0`. With no fader, `Fade` changes nothing and returns a `FadeResult` with `Wired == false`, `Size == Len()` and everything else empty (the `OnFade` hook still runs), even when `ForgetBelow > 0`: forgetting is part of fading and is opt-in too. `WithFader(nil)` is ignored.
 2. **Walk.** Visit facts in ascending ID order. Skip expired facts (`Expiry != nil && *Expiry <= now`): they are neither changed nor forgotten and stay until `Prune`. `Fade` never prunes and never evicts.
 3. **Settle point.** A fact is settled at `max(Observed, FadedAt)`; `FadedAt == 0` means never faded, so `Observed` governs and a fact never decays for time before the store held it. `elapsed = max(0, now - settled)`: never negative, and the subtraction saturates at the maximum `int64` instead of wrapping.
 4. **Call the fader** with a copy of the whole fact, `Private` included: private facts are the holder's own beliefs and fade like any other. A custom fader can exempt them. The built-in policy does not.
 5. **Apply.** A NaN confidence leaves that fact unchanged and not settled (`FadedAt` untouched). Otherwise clamp to `[0,1]`. If the fader returned `forget`, or the clamped confidence is below `Config.Fade.ForgetBelow`, remove the fact and list it in `Forgotten`. Else store the confidence and set `FadedAt = max(FadedAt, now)`; list the ID in `Changed` only if the confidence differs from before. `Fade` changes only `Confidence` and `FadedAt`; `Observed`, `Source`, `Prov`, `Expiry`, `Payload`, `Private` and identity fields are untouched.
 6. **Built-in curve.** For a half-life `h > 0` the new confidence is `confidence * 0.5^(elapsed/h)`; `h = 0` never fades. `h` is `HalfLives[Source]` when present (so a `0` entry exempts that source), else `DefaultHalfLife`. It is the only shipped curve; any other is a `Fader` via `WithFader`.
 7. **Composition.** Because each call decays only the time since the fact was last settled, `Fade(100)` then `Fade(200)` gives the same built-in result as a single `Fade(200)`. A re-added fact replaces the whole fact, so it carries the incoming `FadedAt` (normally `0`).
-8. **Diagnostics.** `Examined` counts every unexpired fact the fader was called on, NaN results included; `Invalid` lists the NaN ones in ascending ID order. `Examined == 0` on a non-empty store means no fader is wired up (for example a mistyped `half_lives` key or all-zero half-lives), which is otherwise indistinguishable from "nothing needed to change". A persistently non-empty `Invalid` means a buggy `Fader`.
+8. **Diagnostics.** `Examined` counts every unexpired fact the fader was called on, NaN results included; `Invalid` lists the NaN ones in ascending ID order. `Wired == false` means no fader is wired up (for example a mistyped `half_lives` key or all-zero half-lives); `Wired == true` with `Examined == 0` means the store was empty or fully expired. Both used to be indistinguishable from "nothing needed to change". A persistently non-empty `Invalid` means a buggy `Fader`.
 
 `FadedAt` is not part of identity and `Add` does not validate it. `All()` returns it, so a persist-and-reload through `All()` and `Add` keeps fading progress. Faded confidence feeds the ordinary rules: `Find` applies the query floor to it, and `MaxFacts` eviction compares it, so a faded store evicts differently from an unfaded one.
 

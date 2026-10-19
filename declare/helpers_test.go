@@ -56,6 +56,10 @@ func sceneCatalog() *declare.Catalog[scene] {
 		}
 		return func(s scene) bool { return s.self.attrs[name] == value }, a.Unknown("name", "value")
 	}))
+	must(cat.RegisterAttributeOps(declare.Attributes[scene]{Sides: []string{"entity"}, Lookup: func(s scene, _, k string) (any, bool) {
+		v, ok := s.self.attrs[k]
+		return v, ok
+	}}, declare.AttributeNames{}))
 	return cat
 }
 
@@ -81,6 +85,14 @@ func encounterCatalog() *declare.Catalog[spread.Encounter] {
 			}, a.Unknown("name", "value")
 		}
 	}
+	must(cat.RegisterAttributeOps(declare.Attributes[spread.Encounter]{Sides: []string{"teller", "listener"}, Lookup: func(e spread.Encounter, side, k string) (any, bool) {
+		h := e.Teller
+		if side == "listener" {
+			h = e.Listener
+		}
+		v, ok := h.(*being).attrs[k]
+		return v, ok
+	}}, declare.AttributeNames{}))
 	must(cat.RegisterCondition("teller_attr_is", attr(false)))
 	must(cat.RegisterCondition("listener_attr_is", attr(true)))
 	must(cat.RegisterCondition("fact_type_in", func(a declare.Args) (logic.Condition[spread.Encounter], error) {

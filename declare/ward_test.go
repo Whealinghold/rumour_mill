@@ -2,12 +2,10 @@ package declare_test
 
 import (
 	"fmt"
-	"slices"
 
 	"github.com/Whealinghold/rumour_mill/declare"
 	"github.com/Whealinghold/rumour_mill/infer"
 	"github.com/Whealinghold/rumour_mill/knowledge"
-	"github.com/Whealinghold/rumour_mill/logic"
 	"github.com/Whealinghold/rumour_mill/rules"
 	"github.com/Whealinghold/rumour_mill/spread"
 )
@@ -33,11 +31,6 @@ type call struct { // what a rule sees: who, about which patient, when
 	at      knowledge.Tick
 }
 
-func roleIn(a declare.Args) (func(string) bool, error) {
-	roles, err := a.Strings("roles")
-	return func(r string) bool { return slices.Contains(roles, r) }, err
-}
-
 func newWard() (*rules.Registry[call], *spread.Spreader, *infer.Engine, declare.Config, error) {
 	doc, err := declare.Load(must1(testdata.Open("testdata/ward.json")), nil)
 	if err != nil {
@@ -50,15 +43,17 @@ func newWard() (*rules.Registry[call], *spread.Spreader, *infer.Engine, declare.
 		Subject: func(c call) string { return c.patient },
 		EventID: func(c call) string { return fmt.Sprint(c.patient, "@", c.at) },
 	})
-	rc.RegisterCondition("role_is", func(a declare.Args) (logic.Condition[call], error) {
-		in, err := roleIn(a)
-		return func(c call) bool { return in(c.who.role) }, err
-	})
+	rc.RegisterAttributeOps(declare.Attributes[call]{Sides: []string{"entity"},
+		Lookup: func(c call, _, k string) (any, bool) { return c.who.role, k == "role" }}, declare.AttributeNames{})
 	fc := declare.NewCatalog[spread.Encounter]()
-	fc.RegisterCondition("listener_role_is", func(a declare.Args) (logic.Condition[spread.Encounter], error) {
-		in, err := roleIn(a)
-		return func(e spread.Encounter) bool { return in(e.Listener.(*staff).role) }, err
-	})
+	fc.RegisterAttributeOps(declare.Attributes[spread.Encounter]{Sides: []string{"teller", "listener"},
+		Lookup: func(e spread.Encounter, side, k string) (any, bool) {
+			h := e.Teller
+			if side == "listener" {
+				h = e.Listener
+			}
+			return h.(*staff).role, k == "role"
+		}}, declare.AttributeNames{})
 	reg, err := rules.NewRegistry(doc.Config.Rules.Config,
 		rules.Layer[call]{Name: "ward"},
 		rules.Layer[call]{Name: "role", Scopes: func(c call) []string { return []string{c.who.role} }})

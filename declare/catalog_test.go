@@ -2,12 +2,14 @@ package declare_test
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/Whealinghold/rumour_mill/declare"
+	"github.com/Whealinghold/rumour_mill/knowledge"
 	"github.com/Whealinghold/rumour_mill/logic"
 )
 
@@ -15,9 +17,13 @@ import (
 type cx struct {
 	n   int
 	log *[]string
+	kb  *knowledge.Store
 }
 
-func newCx(n int) cx { return cx{n: n, log: new([]string)} }
+func newCx(n int) cx {
+	kb, _ := knowledge.NewStore(knowledge.DefaultConfig())
+	return cx{n: n, log: new([]string), kb: kb}
+}
 
 func testCatalog(t testing.TB) *declare.Catalog[cx] {
 	t.Helper()
@@ -51,6 +57,21 @@ func testCatalog(t testing.TB) *declare.Catalog[cx] {
 	// "shared" exists in both namespaces: they are separate.
 	mustReg(cat.RegisterCondition("shared", func(declare.Args) (logic.Condition[cx], error) { return func(cx) bool { return true }, nil }))
 	mustReg(cat.RegisterAction("shared", func(declare.Args) (logic.Action[cx], error) { return func(cx) error { return nil }, nil }))
+	mustReg(cat.RegisterKnowledgeOps(declare.Bindings[cx]{
+		Store:          func(c cx) *knowledge.Store { return c.kb },
+		Now:            func(c cx) knowledge.Tick { return knowledge.Tick(c.n) },
+		Subject:        func(cx) string { return "s" },
+		Discriminators: map[string]func(cx) string{"parity": func(c cx) string { return fmt.Sprint(c.n % 2) }},
+	}))
+	mustReg(cat.RegisterAttributeOps(declare.Attributes[cx]{Sides: []string{"self", "peer"}, Lookup: func(c cx, side, k string) (any, bool) {
+		if k != "n" {
+			return nil, false
+		}
+		if side == "peer" {
+			return c.n + 1, true
+		}
+		return c.n, true
+	}}, declare.AttributeNames{}))
 	return cat
 }
 

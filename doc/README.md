@@ -13,6 +13,9 @@ Phase 1 specs approved with changes (see "Review changes" below). All packages a
 - [spreading-and-inference](specs/spreading-and-inference.md): gossip spreading with decay and injected policy; inference engine (**implemented**)
 - [declarative](specs/declarative.md): `declare` package: Catalog, named conditions/actions, rule loading (**implemented**)
 - [config](specs/config.md): every tunable and default, aggregate config, YAML/JSON document format (**implemented**)
+- [observability-adapters](specs/observability-adapters.md): contract of the Prometheus and OpenTelemetry adapters, wiring, metric table; amended with the observability gap-closing change (**implemented**)
+- [contrib adapters](../contrib/README.md): usage guide for the adapter modules, logger levels, release steps
+- [roadmap](roadmap.md): staged plan for improving the library after v0.1.0
 
 ### Review changes (after Phase 4)
 - `LoadRules` is documented as resolve-all-then-register-with-rollback (not a single atomic step). `declare.RulesConfig` embeds `rules.Config`. A nil `Decoder` means JSON. `Config.Validate` is the home of the two cross-section source-kind checks.
@@ -35,13 +38,12 @@ Phase 1 specs approved with changes (see "Review changes" below). All packages a
 - Restructured: the declarative loader (Catalog, Args, Node, document) is its own `declare` package; spread and infer are concrete (no type parameters); only the caller context `C` is generic.
 - Concurrency: `Store`, `Spreader`, `Engine` are not safe for concurrent use; `Registry` and `Catalog` lock.
 
-- [roadmap](roadmap.md): staged plan for improving the library after v0.1.0
-
-### Roadmap PRDs (stage 1 implemented; others drafted)
+### Roadmap PRDs (stages 1 and 2 implemented; others drafted)
 One PRD per roadmap stage. Stage 3's recipes should land after Stages 1 and 2; Stages 4 and 5 are gated on measured or real consumer need.
 - [stage 1](specs/prd-stage1-richer-rumour-behaviour.md): context-aware `Transform`, time-based fading (`Store.Fade`, `Fader`, `Fact.FadedAt`) (implemented; specs amended: knowledge, spreading-and-inference, config, overview)
 - [plan: stage 1](plans/plan-stage-1.md): per-phase implementation plan and requirement traceability for Stage 1
-- [stage 2](specs/prd-stage2-less-glue-code.md): `spread.Typed`/`TypedTransform`, attribute conditions, discriminator from data, `declare.ArgNames`
+- [stage 2](specs/prd-stage2-less-glue-code.md): `spread.Typed`/`TypedTransform`, attribute conditions, discriminator from data, `declare.ArgNames` (**implemented**)
+- [plan: stage 2](plans/plan-stage-2.md): per-phase implementation plan for Stage 2
 - [stage 3](specs/prd-stage3-docs-and-patterns.md): recipes, data-file hygiene, second-consumer task (gated)
 - [stage 4](specs/prd-stage4-scale-and-persistence.md): benchmarks, internal indexing, round-trip contract
 - [stage 5](specs/prd-stage5-deeper-semantics.md): absence in inference, conflict policy, roles (gated)

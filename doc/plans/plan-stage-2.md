@@ -1,6 +1,6 @@
 # Plan: Stage 2, less glue code
 
-**Status: Proposed.** Sequences [prd-stage2-less-glue-code](../specs/prd-stage2-less-glue-code.md) (roadmap Stage 2) into 6 phases. A plan decides nothing: every behaviour below is fixed by that PRD; the "Decisions" section lists only the sequencing and implementation-shape calls this plan makes within the PRD's room, each with a one-line rationale. Built against `doc/rules/architecture.md` (incl. "Idiomatic Go"), `doc/rules/testing.md` and `doc/rules/specs.md`.
+**Status: Implemented.** Sequences [prd-stage2-less-glue-code](../specs/prd-stage2-less-glue-code.md) (roadmap Stage 2) into 6 phases. A plan decides nothing: every behaviour below is fixed by that PRD; the "Decisions" section lists only the sequencing and implementation-shape calls this plan makes within the PRD's room, each with a one-line rationale. Built against `doc/rules/architecture.md` (incl. "Idiomatic Go"), `doc/rules/testing.md` and `doc/rules/specs.md`.
 
 Conventions found: architecture, testing and spec rules in `doc/rules/`; guard tests `architecture_test.go` (import boundaries), `docs_test.go` (every exported identifier documented), `leak_test.go` (`TestNoDomainVocabulary`); `justfile` targets `test`, `test-race`, `lint`. No plan-format convention exists in the repo (`doc/plans/` is new), so the generic plan template is used.
 
@@ -176,7 +176,7 @@ Made under the lead's principles (open, idiomatic, smallest exported surface, in
 | # | Decision | Rationale |
 | --- | --- | --- |
 | D1 | `TypedTransform` is its own gated phase after `Typed`, and Phase 2 is skipped (not stubbed) if Stage 1 has not landed. | The signature it adapts does not exist in the tree yet; stubbing would ship an unusable API. |
-| D2 | `RegisterAttributeOps` registers all three names or none, via a small unexported multi-register helper in `catalog.go` that checks every name under one lock before inserting. Existing methods and behaviour are unchanged. | The Catalog has no unregister, and a half-registered set on a duplicate name is a trap; the PRD's "no change to Catalog internals" is read as "no behaviour change". Flagged for override. |
+| D2 | `RegisterAttributeOps` registers all three names or none, via a small unexported multi-register helper in `catalog.go` that checks every name under one lock before inserting. Existing methods and behaviour are unchanged. | The Catalog has no unregister, and a half-registered set on a duplicate name is a trap; the PRD's "no change to Catalog internals" is read as "no behaviour change". Flagged for override. Deviation: RegisterAttributeOps does the all-or-none check inline under the catalog lock rather than via a catalog.go helper. |
 | D3 | `Sides` and `Discriminators` are copied at registration. | Instance-owned state, safe against caller mutation (architecture rules 5, 10). |
 | D4 | A nil function in `Bindings.Discriminators` is `ErrBadBindings` at registration. | Otherwise a nil call panics at run time (rule 12); reuses the existing sentinel (R4.4). |
 | D5 | `ArgNames` renames are collision-checked against the base args of both `add_fact` and `knows`, and against each other. | Stage 5 extends the same struct for `knows`; checking now avoids a later breaking rename error. |

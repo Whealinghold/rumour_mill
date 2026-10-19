@@ -13,8 +13,10 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/Whealinghold/rumour_mill/logic"
 )
@@ -91,10 +93,42 @@ type Result struct {
 	// Stopped is StopAll if Process ended early, else StopLayer if some layer was
 	// cut short, else StopNone.
 	Stopped StopMode
+	// Layers has one entry per layer Process reached, in order, including a
+	// layer that StopAll or an action error (OnActionError "stop") ended; layers
+	// after it have none. Layers with no candidates still get a zero entry.
+	// It is freshly allocated per call.
+	Layers []LayerStats
 }
 
 // Fired identifies a rule that fired.
-type Fired struct{ Layer, Scope, RuleID string }
+type Fired struct {
+	Layer, Scope, RuleID string
+	// Failed is true when the rule's action returned an error.
+	Failed bool
+}
+
+// LayerStats counts what happened in one layer during one Process call. It is a
+// plain value, safe to retain and to share between goroutines.
+// Candidates - Skipped - (fired rules in the layer) is the number of
+// candidates never reached because a Stop mode cut the layer short.
+type LayerStats struct {
+	Layer      string
+	Candidates int // rules matching the event and ctx's scope keys
+	Skipped    int // candidates whose When was false
+	Failed     int // actions that returned an error
+}
+
+// Unmatched reports whether no layer had any candidate rule for the event
+// (typically an unregistered or misspelt event type). It is true when Layers
+// is empty. It is safe for concurrent use.
+func (r Result) Unmatched() bool {
+	for _, l := range r.Layers {
+		if l.Candidates > 0 {
+			return false
+		}
+	}
+	return true
+}
 
 type ruleKey struct{ layer, scope, event string }
 type idKey struct{ layer, scope, id string }
@@ -117,10 +151,97 @@ type Registry[C any] struct {
 	layers []Layer[C]
 	index  map[string]int
 
-	mu    sync.RWMutex
-	byKey map[ruleKey][]entry[C]
-	ids   map[idKey]string // rule ID -> its event type
-	seq   uint64
+	emitMu sync.Mutex // serialises Register/Unregister with their hook delivery, so Count snapshots arrive in order
+	mu     sync.RWMutex
+	byKey  map[ruleKey][]entry[C]
+	ids    map[idKey]string // rule ID -> its event type
+	seq    uint64
+	count  map[string]int // rules per layer
+	hooks  []Hooks
+	log    *slog.Logger
+	clock  func() time.Time
+}
+
+// Hooks are read-only observers of a Registry. A nil field is ignored.
+// Hooks run synchronously on the caller's goroutine, with no registry
+// lock held, and must not change the outcome. OnRegister and OnUnregister are
+// delivered in the order the changes were made (calls are serialised), so a
+// hook must not call Register or Unregister on the same Registry. A Hooks value
+// is plain data, safe to copy; the funcs themselves must be safe for
+// concurrent use if the Registry is shared.
+type Hooks struct {
+	// OnProcess runs once per Process call, at the end, with the Result and the
+	// returned error. It also runs on the early return of OnActionError "stop".
+	OnProcess func(Result, error)
+	// OnProcessDone runs after OnProcess with the call's duration (never
+	// negative), only when a clock was set with SetClock.
+	OnProcessDone func(time.Duration)
+	// OnRegister runs after every Register call, failures included.
+	OnRegister func(RegisterEvent)
+	// OnUnregister runs after every Unregister call.
+	OnUnregister func(UnregisterEvent)
+}
+
+// RegisterEvent describes one Register call. It is a plain value, safe to retain
+// and to share between goroutines.
+type RegisterEvent struct {
+	Layer, Scope, RuleID string
+	Count                int   // rules in Layer after the call; 0 for an unknown layer
+	Err                  error // the error Register returned, nil on success
+}
+
+// UnregisterEvent describes one Unregister call. It is a plain value, safe to
+// retain and to share between goroutines.
+type UnregisterEvent struct {
+	Layer, Scope, RuleID string
+	Removed              bool // whether the rule existed
+	Count                int  // rules in Layer after the call
+}
+
+// Layers returns the layer names in registration order, as a fresh slice.
+// It is safe for concurrent use.
+func (r *Registry[C]) Layers() []string {
+	out := make([]string, len(r.layers))
+	for i, l := range r.layers {
+		out[i] = l.Name
+	}
+	return out
+}
+
+// RuleCount returns the number of rules in layer across all scopes, 0 for an
+// unknown layer. It is safe for concurrent use.
+func (r *Registry[C]) RuleCount(layer string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.count[layer]
+}
+
+// SetClock sets the clock used to time Process for Hooks.OnProcessDone. A nil
+// now clears it; with no clock the time is never read. It is safe for
+// concurrent use and applies from the next Process.
+func (r *Registry[C]) SetClock(now func() time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clock = now
+}
+
+// Observe adds h to the registry's observers. Calls chain: hooks run in the
+// order given. It is safe at any time and applies from the next Process.
+func (r *Registry[C]) Observe(h Hooks) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.hooks = append(slices.Clone(r.hooks), h)
+}
+
+// SetLogger sets the logger used for a Debug summary per Process and a Warn
+// when Process returns an error. A nil l is ignored. The default discards.
+func (r *Registry[C]) SetLogger(l *slog.Logger) {
+	if l == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.log = l
 }
 
 // NewRegistry returns an empty registry with the given ordered layers. It
@@ -136,6 +257,8 @@ func NewRegistry[C any](cfg Config, layers ...Layer[C]) (*Registry[C], error) {
 		index:  make(map[string]int, len(layers)),
 		byKey:  make(map[ruleKey][]entry[C]),
 		ids:    make(map[idKey]string),
+		count:  make(map[string]int),
+		log:    slog.New(slog.DiscardHandler),
 	}
 	for i, l := range layers {
 		if l.Name == "" {
@@ -153,8 +276,27 @@ func NewRegistry[C any](cfg Config, layers ...Layer[C]) (*Registry[C], error) {
 // Scopes) takes only the scope "". It returns ErrUnknownLayer for a layer the
 // registry lacks, ErrInvalidRule for an empty ID or Event, an unknown Stop, or
 // a non-empty scope on a universal layer, and ErrDuplicateRule if the
-// (layer, scope, ID) is already registered.
+// (layer, scope, ID) is already registered. A successful
+// call logs a Debug line (ok=true); a failed call logs nothing, since the
+// error is returned to the caller.
 func (r *Registry[C]) Register(layer, scope string, rule Rule[C]) error {
+	r.emitMu.Lock()
+	defer r.emitMu.Unlock()
+	r.mu.Lock()
+	err := r.register(layer, scope, rule)
+	ev := RegisterEvent{Layer: layer, Scope: scope, RuleID: rule.ID, Count: r.count[layer], Err: err}
+	hooks := r.hooks
+	r.mu.Unlock()
+	for _, h := range hooks {
+		if h.OnRegister != nil {
+			h.OnRegister(ev)
+		}
+	}
+	return err
+}
+
+// register does the work of Register with r.mu held.
+func (r *Registry[C]) register(layer, scope string, rule Rule[C]) error {
 	i, ok := r.index[layer]
 	if !ok {
 		return fmt.Errorf("%w: %q", ErrUnknownLayer, layer)
@@ -168,8 +310,6 @@ func (r *Registry[C]) Register(layer, scope string, rule Rule[C]) error {
 		return fmt.Errorf("%w: %q is in universal layer %q, which takes only scope \"\"", ErrInvalidRule, rule.ID, layer)
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	id := idKey{layer, scope, rule.ID}
 	if _, dup := r.ids[id]; dup {
 		return fmt.Errorf("%w: %s/%s/%s", ErrDuplicateRule, layer, scope, rule.ID)
@@ -177,25 +317,47 @@ func (r *Registry[C]) Register(layer, scope string, rule Rule[C]) error {
 	r.ids[id] = rule.Event
 	k := ruleKey{layer, scope, rule.Event}
 	r.seq++
+	r.count[layer]++
 	r.byKey[k] = append(r.byKey[k], entry[C]{rule: rule, scope: scope, seq: r.seq})
+	r.log.Debug("rule registered", "layer", layer, "scope", scope, "rule", rule.ID, "ok", true)
 	return nil
 }
 
-// Unregister removes a rule and reports whether it existed.
+// Unregister removes a rule and reports whether it existed. It logs a
+// Debug line either way (ok=false when the rule was not registered). It is
+// safe for concurrent use.
 func (r *Registry[C]) Unregister(layer, scope, ruleID string) bool {
+	r.emitMu.Lock()
+	defer r.emitMu.Unlock()
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	removed := r.unregister(layer, scope, ruleID)
+	ev := UnregisterEvent{Layer: layer, Scope: scope, RuleID: ruleID, Removed: removed, Count: r.count[layer]}
+	hooks := r.hooks
+	r.mu.Unlock()
+	for _, h := range hooks {
+		if h.OnUnregister != nil {
+			h.OnUnregister(ev)
+		}
+	}
+	return removed
+}
+
+// unregister does the work of Unregister with r.mu held.
+func (r *Registry[C]) unregister(layer, scope, ruleID string) bool {
 	id := idKey{layer, scope, ruleID}
 	event, ok := r.ids[id]
 	if !ok {
+		r.log.Debug("rule unregistered", "layer", layer, "scope", scope, "rule", ruleID, "ok", false)
 		return false
 	}
 	delete(r.ids, id)
+	r.count[layer]--
 	k := ruleKey{layer, scope, event}
 	r.byKey[k] = slices.DeleteFunc(slices.Clone(r.byKey[k]), func(e entry[C]) bool { return e.rule.ID == ruleID })
 	if len(r.byKey[k]) == 0 {
 		delete(r.byKey, k)
 	}
+	r.log.Debug("rule unregistered", "layer", layer, "scope", scope, "rule", ruleID, "ok", true)
 	return true
 }
 
@@ -246,17 +408,66 @@ func scopeKeys[C any](l Layer[C], ctx C) []string {
 // its Stop); with "stop" Process returns right after the failing rule. An event
 // type with no rules is not an error.
 func (r *Registry[C]) Process(ctx C, eventType string) (Result, error) {
+	r.mu.RLock()
+	clock := r.clock
+	r.mu.RUnlock()
+	var start time.Time
+	if clock != nil {
+		start = clock()
+	}
+	res, err := r.process(ctx, eventType)
+	r.mu.RLock()
+	hooks, log := r.hooks, r.log
+	r.mu.RUnlock()
+	var considered, skipped, failed int
+	for _, l := range res.Layers {
+		considered += l.Candidates
+		skipped += l.Skipped
+		failed += l.Failed
+	}
+	ids := make([]string, len(res.Fired))
+	for i, f := range res.Fired {
+		ids[i] = f.Layer + "/" + f.Scope + "/" + f.RuleID
+	}
+	log.Debug("rules: processed", "event", eventType, "fired", len(res.Fired), "stopped", string(res.Stopped),
+		"rules", ids, "considered", considered, "skipped", skipped, "failed", failed, "unmatched", res.Unmatched())
+	if err != nil {
+		log.Warn("rules: process failed", "event", eventType, "fired", len(res.Fired), "err", err)
+	}
+	for _, h := range hooks {
+		if h.OnProcess != nil {
+			h.OnProcess(res, err)
+		}
+	}
+	if clock != nil {
+		d := max(clock().Sub(start), 0)
+		for _, h := range hooks {
+			if h.OnProcessDone != nil {
+				h.OnProcessDone(d)
+			}
+		}
+	}
+	return res, err
+}
+
+func (r *Registry[C]) process(ctx C, eventType string) (Result, error) {
 	var res Result
 	var errs []error
 layers:
 	for _, layer := range r.layers {
-		for _, e := range r.gather(layer.Name, scopeKeys(layer, ctx), eventType) {
+		list := r.gather(layer.Name, scopeKeys(layer, ctx), eventType)
+		res.Layers = append(res.Layers, LayerStats{Layer: layer.Name, Candidates: len(list)})
+		st := &res.Layers[len(res.Layers)-1]
+		for _, e := range list {
 			if e.rule.When != nil && !e.rule.When(ctx) {
+				st.Skipped++
 				continue
 			}
-			res.Fired = append(res.Fired, Fired{layer.Name, e.scope, e.rule.ID})
+			res.Fired = append(res.Fired, Fired{Layer: layer.Name, Scope: e.scope, RuleID: e.rule.ID})
 			if e.rule.Do != nil {
 				if err := e.rule.Do(ctx); err != nil {
+					res.Fired[len(res.Fired)-1].Failed = true
+					st.Failed++
 					errs = append(errs, fmt.Errorf("rules: %s/%s/%s: %w", layer.Name, e.scope, e.rule.ID, err))
 					if r.cfg.OnActionError == StopOnError {
 						return res, errors.Join(errs...)
