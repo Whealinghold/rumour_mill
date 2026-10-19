@@ -1,6 +1,6 @@
 # PRD: Stage 2, less glue code
 
-Status: draft · Owner: lead agent (rumour_mill) · Last updated: 2026-10-18 · Sign-off: repo owner (Andy Beak)
+Status: implemented · Owner: lead agent (rumour_mill) · Last updated: 2026-10-18 · Sign-off: repo owner (Andy Beak)
 
 Roadmap source: `doc/roadmap.md`, Stage 2. Builds on `spread` and `declare` as specified in [spreading-and-inference](spreading-and-inference.md), [declarative](declarative.md) and [config](config.md). Conventions followed: `doc/rules/architecture.md` (incl. "Idiomatic Go"), `doc/rules/testing.md`, `doc/rules/specs.md`. No design-system doc exists and the library has no UI, so the UX section is N/A. Tags: **[D]** decided (by a doc, the code, or the lead's brief). Every item is now decided; see Decisions.
 

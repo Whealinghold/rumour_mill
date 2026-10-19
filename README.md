@@ -75,11 +75,11 @@ func (c *Crew) Knowledge() *knowledge.Store { return c.kb }
 
 cfg := spread.DefaultConfig()
 cfg.ReceivedKind = "hearsay"
-sp, _ := spread.New(cfg, spread.WithFilter(func(e spread.Encounter) bool {
-	// customs staff never pass smuggling intel to the haulers
-	t, l := e.Teller.(*Crew), e.Listener.(*Crew)
-	return !(t.guild == "customs" && l.guild == "haulers" && e.Fact.Type == "captain_is_smuggler")
-}))
+// customs staff never pass smuggling intel to the haulers
+noLeak := spread.Typed(func(e spread.TypedEncounter[*Crew]) bool {
+	return !(e.Teller.guild == "customs" && e.Listener.guild == "haulers" && e.Fact.Type == "captain_is_smuggler")
+})
+sp, _ := spread.New(cfg, spread.WithFilter(noLeak))
 res, _ := sp.Spread(ilse, []spread.Holder{broker, inspector}, now) // 0.9 arrives as 0.72, hop 1
 
 engine, _ := infer.New(infer.DefaultConfig(), []infer.Rule{{
@@ -90,6 +90,8 @@ engine, _ := infer.New(infer.DefaultConfig(), []infer.Rule{{
 }})
 engine.Run(broker.kb, now) // derives the conclusion once; running again changes nothing
 ```
+
+When the holders are one Go type, `spread.Typed` hands the filter typed values, so there is no hand assertion (a holder of another type is blocked, never a panic); `spread.TypedTransform` does the same for `Transform`. Compiled twin: `Example_typedFilter` in [`spread/typed_test.go`](spread/typed_test.go).
 
 One optional `Transform` hook sees the teller, listener, tick and the teller's own copy, so distortion can depend on who is talking, to whom, and how old the news is. Fading is a step you call: `store.Fade(now)` lowers confidence by a policy (an exponential half-life per source kind from config, or your own `knowledge.Fader`), and forgets facts that fall below `forget_below`. It is off unless configured; the library has no clock.
 
@@ -136,14 +138,50 @@ cat.RegisterCondition("role_is", func(a declare.Args) (logic.Condition[Call], er
 err = declare.LoadRules(registry, doc.Config.Rules, doc.Rules, cat) // all-or-nothing, errors carry paths
 ```
 
+Relational rules need no Go condition: register your attribute lookup once with `RegisterAttributeOps` and use `attr_equals`, `attr_in` and `attr_same` from the data file. `add_fact` can set a fact's identity from data with `discriminator` (literal) or `discriminator_from` (a named source in `Bindings.Discriminators`). Compiled twins: `Example_officeDepts` and `Example_discriminator` in [`declare/example_test.go`](declare/example_test.go), data in [`declare/testdata/office_depts.json`](declare/testdata/office_depts.json).
+
+```go
+cat.RegisterAttributeOps(declare.Attributes[Call]{
+	Sides:  []string{"entity"},
+	Lookup: func(c Call, side, key string) (any, bool) { v, ok := c.self.attrs[key]; return v, ok },
+}, declare.AttributeNames{}) // empty names = attr_equals, attr_in, attr_same
+```
+
+```json
+{ "use": "attr_equals", "args": { "side": "entity", "key": "dept", "value": "finance" } }
+{ "use": "add_fact", "args": { "type": "spilled_coffee", "confidence": 0.9, "source": "seen", "discriminator_from": "room" } }
+```
+
 YAML without a dependency in this module: pass `func(r io.Reader, v any) error { d := yaml.NewDecoder(r); d.KnownFields(true); return d.Decode(v) }` as the decoder.
+
+## Observability
+
+Everything is optional and does nothing by default; the core module stays standard-library only. Each component takes `log/slog` loggers and synchronous, read-only hooks, and repeated options chain:
+
+```go
+logger := slog.Default()
+store, _ := knowledge.NewStore(kcfg, knowledge.WithLogger(logger), knowledge.WithHooks(knowledge.Hooks{
+	OnAdd: func(f knowledge.Fact, r knowledge.AddResult) { /* add_fact, spread and infer all land here */ },
+}))
+sp, _ := spread.New(cfg, spread.WithLogger(logger), spread.WithHooks(spread.Hooks{
+	OnSpread: func(r spread.Result, err error) { /* r.Dropped, r.HolderMismatches, joined store errors */ },
+}))
+engine, _ := infer.New(icfg, irules, infer.WithLogger(logger))
+registry.SetLogger(logger)
+registry.Observe(rules.Hooks{OnProcess: func(r rules.Result, err error) {}})
+```
+
+Results also say why nothing happened: `rules.Result.Layers` and `Unmatched()` (candidates and skipped rules per layer), `spread.Result.SkippedListeners` and `Withheld`, `infer.Result.Truncated`, `knowledge.FadeResult.Wired`, and `Store.Len()` with the size carried on `AddResult`, `FadeResult` and `PruneResult`. Timing is opt-in: give a component a clock (`spread.WithClock(time.Now)`, `infer.WithClock`, `knowledge.WithClock`, `registry.SetClock`) and the `*Done` / `OnDuration` hooks fire; without one nothing is timed.
+
+For Prometheus or OpenTelemetry, the separate modules in [`contrib/`](contrib/README.md) wire all of this in a few lines.
 
 ## Development
 
 ```
-just test        # go test ./...
+just test        # go test ./... (root and both contrib modules)
 just test-race   # go test -race ./...
-just lint        # go vet ./...
+just lint        # go vet ./... (root and both contrib modules)
+just release-adapters vX.Y.Z   # pin adapters, print tag commands (never tags)
 ```
 
 Module: `github.com/Whealinghold/rumour_mill`. Licence: MIT.

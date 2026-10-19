@@ -14,7 +14,9 @@ package infer
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
+	"time"
 
 	"github.com/Whealinghold/rumour_mill/knowledge"
 )
@@ -94,6 +96,11 @@ type Rule struct {
 type Result struct {
 	Derived []knowledge.AddResult // facts inserted or replaced, in the order produced
 	Passes  int                   // passes executed (at least 1)
+	// Truncated reports that MaxPasses was greater than 1 and the last pass
+	// still inserted or replaced facts, so chaining may have been cut short.
+	// It is conservative: a chain that reaches its fixpoint exactly on the last
+	// pass is also flagged, and MaxPasses of 1 never sets it.
+	Truncated bool
 }
 
 // Engine applies a fixed set of rules to knowledge stores. It is immutable.
@@ -104,11 +111,84 @@ type Result struct {
 type Engine struct {
 	cfg   Config
 	rules []Rule
+	hooks Hooks
+	log   *slog.Logger
+	now   func() time.Time
+}
+
+// Hooks are optional observers of an Engine. Any field may be nil. Hooks are
+// called synchronously on the caller's goroutine, must treat their arguments
+// as read-only, and must not change what Run does. A Hooks value is
+// plain data; the funcs must be safe for concurrent use if the Engine is shared.
+type Hooks struct {
+	// OnRun is called once at the end of every Run, with its Result and the
+	// error Run returns (nil on success). That includes Runs that fail with
+	// store errors, and the ErrNilStore call (with a zero Result), so error
+	// counters stay accurate. Exhausting MaxPasses is not an error.
+	OnRun func(Result, error)
+	// OnRunDone is called after OnRun on every Run, including the ErrNilStore
+	// call, with the elapsed time (never negative). It fires only when a clock
+	// was given with WithClock.
+	OnRunDone func(time.Duration)
+}
+
+// Option configures an Engine at construction. Options are applied once, in New,
+// and are not safe to share with a running Engine; the Option func itself holds
+// no state and may be reused across New calls.
+type Option func(*Engine)
+
+// WithHooks adds observer hooks. It may be given several times; for each
+// field the earlier hook runs first, then this one. Nil fields are ignored.
+func WithHooks(h Hooks) Option {
+	return func(e *Engine) {
+		if h.OnRun != nil {
+			prev, next := e.hooks.OnRun, h.OnRun
+			e.hooks.OnRun = func(r Result, err error) {
+				if prev != nil {
+					prev(r, err)
+				}
+				next(r, err)
+			}
+		}
+		if h.OnRunDone != nil {
+			prev, next := e.hooks.OnRunDone, h.OnRunDone
+			e.hooks.OnRunDone = func(d time.Duration) {
+				if prev != nil {
+					prev(d)
+				}
+				next(d)
+			}
+		}
+	}
+}
+
+// WithClock injects the clock used to time Run for Hooks.OnRunDone. It is read
+// at the start of Run and just before OnRun; without it the clock is never
+// read and OnRunDone never fires. A nil now is ignored.
+func WithClock(now func() time.Time) Option {
+	return func(e *Engine) {
+		if now != nil {
+			e.now = now
+		}
+	}
+}
+
+// WithLogger sets the logger. Run logs one Debug line per call (passes,
+// derived, truncated, and by_rule: facts inserted or replaced per rule ID),
+// a Warn when it returns an error and a Warn when the run was truncated. A nil logger is ignored; the
+// default discards everything.
+func WithLogger(l *slog.Logger) Option {
+	return func(e *Engine) {
+		if l != nil {
+			e.log = l
+		}
+	}
 }
 
 // New validates the rules and returns an Engine. The rules are copied. All
 // problems are reported together, wrapping ErrInvalidRule or ErrInvalidConfig.
-func New(cfg Config, rules []Rule) (*Engine, error) {
+// Options are applied in the order given.
+func New(cfg Config, rules []Rule, opts ...Option) (*Engine, error) {
 	errs := []error{cfg.Validate()}
 	seen := make(map[string]bool, len(rules))
 	for i, r := range rules {
@@ -150,7 +230,13 @@ func New(cfg Config, rules []Rule) (*Engine, error) {
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
-	return &Engine{cfg: cfg, rules: cloneRules(rules)}, nil
+	e := &Engine{cfg: cfg, rules: cloneRules(rules), log: slog.New(slog.DiscardHandler)}
+	for _, o := range opts {
+		if o != nil {
+			o(e)
+		}
+	}
+	return e, nil
 }
 
 func cloneRules(rules []Rule) []Rule {
@@ -185,20 +271,58 @@ func cloneRules(rules []Rule) []Rule {
 // subject: the rule fires once for every subject that satisfies all of them
 // (in ascending order). Fixed-subject requirements are checked independently
 // of it. A derived fact takes the bound subject unless the product fixes one.
+//
+// The OnRun hook and the logger observe every call, including the nil-store
+// error.
 func (e *Engine) Run(store *knowledge.Store, now knowledge.Tick) (Result, error) {
+	var start time.Time
+	if e.now != nil {
+		start = e.now()
+	}
+	res, byRule, err := e.run(store, now)
+	switch {
+	case err != nil:
+		e.log.Warn("infer run failed", "passes", res.Passes, "derived", len(res.Derived), "err", err)
+	default:
+		e.log.Debug("infer run", "passes", res.Passes, "derived", len(res.Derived), "truncated", res.Truncated, "by_rule", byRule)
+	}
+	if res.Truncated {
+		e.log.Warn("infer run truncated", "passes", res.Passes, "max_passes", e.cfg.MaxPasses, "derived", len(res.Derived))
+	}
+	var end time.Time
+	if e.now != nil {
+		end = e.now()
+	}
+	if e.hooks.OnRun != nil {
+		e.hooks.OnRun(res, err)
+	}
+	if e.now != nil && e.hooks.OnRunDone != nil {
+		e.hooks.OnRunDone(max(end.Sub(start), 0))
+	}
+	return res, err
+}
+
+// run also returns, for logging only, how many facts each rule inserted or replaced.
+func (e *Engine) run(store *knowledge.Store, now knowledge.Tick) (Result, map[string]int, error) {
 	if store == nil {
-		return Result{}, ErrNilStore
+		return Result{}, nil, ErrNilStore
 	}
 	var res Result
+	byRule := map[string]int{}
 	for pass := 1; pass <= e.cfg.MaxPasses; pass++ {
 		res.Passes = pass
 		var batch []knowledge.Fact
+		var owner []string // rule ID per batch fact
 		for _, r := range e.rules {
-			batch = append(batch, e.fire(store, r, now)...)
+			fs := e.fire(store, r, now)
+			batch = append(batch, fs...)
+			for range fs {
+				owner = append(owner, r.ID)
+			}
 		}
 		changed := 0
 		var errs []error
-		for _, f := range batch {
+		for i, f := range batch {
 			add, err := store.Add(f)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("infer: %s: %w", f.ID, err))
@@ -206,17 +330,21 @@ func (e *Engine) Run(store *knowledge.Store, now knowledge.Tick) (Result, error)
 			}
 			if add.Outcome != knowledge.Rejected {
 				res.Derived = append(res.Derived, add)
+				byRule[owner[i]]++
 				changed++
 			}
 		}
 		if len(errs) > 0 {
-			return res, errors.Join(errs...)
+			return res, byRule, errors.Join(errs...)
 		}
 		if changed == 0 {
 			break
 		}
+		if pass == e.cfg.MaxPasses && pass > 1 {
+			res.Truncated = true
+		}
 	}
-	return res, nil
+	return res, byRule, nil
 }
 
 // fire returns the facts rule r derives from store, one per satisfying subject.

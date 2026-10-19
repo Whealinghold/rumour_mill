@@ -1,11 +1,14 @@
 package knowledge
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"math"
 	"slices"
 	"strings"
+	"time"
 )
 
 // idSep separates the parts of a derived fact ID. Add rejects it in those parts.
@@ -23,6 +26,9 @@ type Store struct {
 	merge MergePolicy
 	facts map[string]Fact
 	fader Fader
+	clock func() time.Time
+	hooks []Hooks
+	log   *slog.Logger
 }
 
 // Option configures a Store at construction.
@@ -45,7 +51,7 @@ func NewStore(cfg Config, opts ...Option) (*Store, error) {
 	}
 	cfg.SourceRanks = maps.Clone(cfg.SourceRanks)
 	cfg.Fade.HalfLives = maps.Clone(cfg.Fade.HalfLives)
-	s := &Store{cfg: cfg, merge: RankThenConfidence, facts: make(map[string]Fact)}
+	s := &Store{cfg: cfg, merge: RankThenConfidence, facts: make(map[string]Fact), log: slog.New(slog.DiscardHandler)}
 	for _, o := range opts {
 		o(s)
 	}
@@ -68,12 +74,41 @@ func (s *Store) rank(source string) int {
 //
 // It returns ErrInvalidFact for an empty Type or Source or a NaN Confidence,
 // and ErrIdentityMismatch if the ID exists with a different Type or Subject.
-func (s *Store) Add(f Fact) (AddResult, error) {
+func (s *Store) Add(in Fact) (AddResult, error) {
+	f, res, err := s.add(in)
+	if err != nil {
+		reason := AddErrorInvalid
+		if errors.Is(err, ErrIdentityMismatch) {
+			reason = AddErrorIdentityMismatch
+			s.log.Warn("knowledge: add identity mismatch", "fact", f.ID, "error", err)
+		} else {
+			s.log.Warn("knowledge: add invalid fact", "type", f.Type, "source", f.Source, "error", err)
+		}
+		for _, h := range s.hooks {
+			if h.OnAddError != nil {
+				h.OnAddError(clone(in), reason, err)
+			}
+		}
+		return res, err
+	}
+	if len(res.Evicted) > 0 {
+		s.log.Warn("knowledge: add evicted facts", "fact", res.ID, "outcome", res.Outcome.String(), "evicted", len(res.Evicted))
+	}
+	for _, h := range s.hooks {
+		if h.OnAdd != nil {
+			h.OnAdd(clone(f), res)
+		}
+	}
+	return res, nil
+}
+
+// add does the work of Add and also returns the normalised incoming fact.
+func (s *Store) add(f Fact) (Fact, AddResult, error) {
 	if f.Type == "" || f.Source == "" || math.IsNaN(f.Confidence) {
-		return AddResult{}, fmt.Errorf("%w: type %q, source %q, confidence %v", ErrInvalidFact, f.Type, f.Source, f.Confidence)
+		return f, AddResult{}, fmt.Errorf("%w: type %q, source %q, confidence %v", ErrInvalidFact, f.Type, f.Source, f.Confidence)
 	}
 	if strings.Contains(f.Type+f.Subject+f.Discriminator, idSep) {
-		return AddResult{}, fmt.Errorf("%w: type, subject and discriminator must not contain U+001F", ErrInvalidFact)
+		return f, AddResult{}, fmt.Errorf("%w: type, subject and discriminator must not contain U+001F", ErrInvalidFact)
 	}
 	f.Confidence = min(max(f.Confidence, 0), 1)
 	if f.ID == "" {
@@ -90,17 +125,19 @@ func (s *Store) Add(f Fact) (AddResult, error) {
 		if slices.Contains(res.Evicted, f.ID) {
 			res.Outcome = Rejected
 		}
-		return res, nil
+		res.Size = len(s.facts)
+		return f, res, nil
 	}
 	if existing.Type != f.Type || existing.Subject != f.Subject {
-		return AddResult{}, fmt.Errorf("%w: %q holds (%q, %q), got (%q, %q)",
+		return f, AddResult{}, fmt.Errorf("%w: %q holds (%q, %q), got (%q, %q)",
 			ErrIdentityMismatch, f.ID, existing.Type, existing.Subject, f.Type, f.Subject)
 	}
 	if s.merge(existing, f, s.rank) == Replace {
 		s.facts[f.ID] = f
 		res.Outcome = Replaced
 	}
-	return res, nil
+	res.Size = len(s.facts)
+	return f, res, nil
 }
 
 // enforceCap evicts the weakest facts while the store is over MaxFacts:
@@ -147,6 +184,10 @@ func (s *Store) Get(id string) (Fact, bool) {
 // order. A nil q.MinConfidence uses Config.QueryFloor. Matching is exact and
 // case-sensitive.
 func (s *Store) Find(q Query, now Tick) []Fact {
+	if s.clock != nil {
+		start := s.clock()
+		defer func() { s.duration(OpFind, start) }()
+	}
 	floor := s.cfg.QueryFloor
 	if q.MinConfidence != nil {
 		floor = *q.MinConfidence
@@ -167,8 +208,13 @@ func (s *Store) Find(q Query, now Tick) []Fact {
 	return out
 }
 
-// Prune deletes expired facts and returns how many it removed.
+// Prune deletes expired facts and returns how many it removed. It logs at
+// Debug and calls Hooks.OnPrune on every call, including when nothing expired.
 func (s *Store) Prune(now Tick) int {
+	if s.clock != nil {
+		start := s.clock()
+		defer func() { s.duration(OpPrune, start) }()
+	}
 	n := 0
 	for id, f := range s.facts {
 		if expired(f, now) {
@@ -176,7 +222,63 @@ func (s *Store) Prune(now Tick) int {
 			n++
 		}
 	}
+	s.log.Debug("knowledge: prune", "removed", n, "size", len(s.facts))
+	for _, h := range s.hooks {
+		if h.OnPrune != nil {
+			h.OnPrune(PruneResult{Removed: n, Size: len(s.facts)})
+		}
+	}
 	return n
+}
+
+// Len returns the number of facts held, including expired and low-confidence
+// ones. It is O(1) and, like the rest of Store, not safe for concurrent use.
+func (s *Store) Len() int { return len(s.facts) }
+
+// duration reports the time since start to OnDuration hooks; only called when
+// a clock is set.
+func (s *Store) duration(op string, start time.Time) {
+	d := max(s.clock().Sub(start), 0)
+	for _, h := range s.hooks {
+		if h.OnDuration != nil {
+			h.OnDuration(op, d)
+		}
+	}
+}
+
+// PruneResult reports one Prune call to Hooks.OnPrune. It is a plain value,
+// safe from any goroutine once delivered.
+type PruneResult struct {
+	Removed int // facts deleted
+	Size    int // Len() after the prune
+}
+
+// Add error reasons passed to Hooks.OnAddError.
+const (
+	AddErrorInvalid          = "invalid"
+	AddErrorIdentityMismatch = "identity_mismatch"
+)
+
+// Operations named in Hooks.OnDuration.
+const (
+	OpFind  = "find"
+	OpFade  = "fade"
+	OpPrune = "prune"
+)
+
+// AddErrorReasons returns a fresh slice of every reason OnAddError can report,
+// for seeding metric series. Safe for concurrent use.
+func AddErrorReasons() []string { return []string{AddErrorInvalid, AddErrorIdentityMismatch} }
+
+// WithClock injects the clock used to time Find, Fade and Prune for
+// Hooks.OnDuration; nil is ignored. Without a clock the Store never reads time
+// and OnDuration never fires.
+func WithClock(now func() time.Time) Option {
+	return func(s *Store) {
+		if now != nil {
+			s.clock = now
+		}
+	}
 }
 
 // All returns every fact, including expired and low-confidence ones, in
@@ -199,4 +301,45 @@ func clone(f Fact) Fact {
 		f.Expiry = &e
 	}
 	return f
+}
+
+// Hooks observe a Store. Nil fields are ignored. Hooks run synchronously on the
+// caller's goroutine, must not call back into the Store, and must treat their
+// arguments as read-only. Observing never changes what the Store does.
+type Hooks struct {
+	// OnAdd runs after every successful Add, whoever called it (add_fact, spread
+	// delivery, inference), once the cap is enforced. f.ID equals r.ID. It does
+	// not run when Add returns an error. A Rejected result still counts as a
+	// successful Add.
+	OnAdd func(f Fact, r AddResult)
+	// OnAddError runs once for every Add that returns an error, before Add
+	// returns. f is a copy of the fact as passed (not normalised); reason is
+	// AddErrorInvalid or AddErrorIdentityMismatch. OnAdd does not run.
+	OnAddError func(f Fact, reason string, err error)
+	// OnFade runs at the end of every Fade, also when no Fader is wired (then
+	// r.Wired is false and only Size is set).
+	OnFade func(r FadeResult)
+	// OnPrune runs at the end of every Prune, including when Removed is 0.
+	OnPrune func(r PruneResult)
+	// OnDuration runs after an operation's own hook, with op one of OpFind,
+	// OpFade, OpPrune and the elapsed time floored at 0. It fires only if
+	// WithClock was given.
+	OnDuration func(op string, d time.Duration)
+}
+
+// WithHooks adds h to the Store. It is repeatable: hooks run in the order given.
+func WithHooks(h Hooks) Option {
+	return func(s *Store) { s.hooks = append(s.hooks, h) }
+}
+
+// WithLogger sets the Store's logger; nil is ignored. The default discards
+// everything. It logs at Warn when an Add evicts facts or hits
+// ErrIdentityMismatch or ErrInvalidFact (never the payload), at Warn when a Fade finds invalid Fader results, and at
+// Debug a summary of each Prune and of each Fade.
+func WithLogger(l *slog.Logger) Option {
+	return func(s *Store) {
+		if l != nil {
+			s.log = l
+		}
+	}
 }

@@ -25,6 +25,8 @@ type FadeResult struct {
 	Forgotten []string // IDs removed from the store
 	Invalid   []string // IDs whose Fader result was NaN, so they were left unchanged and unsettled
 	Examined  int      // unexpired facts the Fader was called on; 0 with a non-empty store means fading is not wired up
+	Wired     bool     // a Fader is in effect; false means Fade did nothing
+	Size      int      // Len() after the Fade
 }
 
 // WithFader sets the Fader used by Fade, replacing the one built from
@@ -48,10 +50,18 @@ func WithFader(f Fader) Option {
 // so or the result is below Config.Fade.ForgetBelow. Only Confidence and
 // FadedAt are modified. Not safe for concurrent use.
 func (s *Store) Fade(now Tick) FadeResult {
+	if s.clock != nil {
+		start := s.clock()
+		defer func() { s.duration(OpFade, start) }()
+	}
 	var res FadeResult
 	if s.fader == nil {
+		res.Size = len(s.facts)
+		s.log.Debug("knowledge: fade", "wired", false, "size", res.Size)
+		s.fireFade(res)
 		return res
 	}
+	res.Wired = true
 	for _, id := range slices.Sorted(maps.Keys(s.facts)) {
 		f := s.facts[id]
 		if expired(f, now) {
@@ -76,7 +86,21 @@ func (s *Store) Fade(now Tick) FadeResult {
 			res.Changed = append(res.Changed, id)
 		}
 	}
+	res.Size = len(s.facts)
+	s.log.Debug("knowledge: fade", "wired", true, "size", res.Size, "examined", res.Examined, "changed", len(res.Changed), "forgotten", len(res.Forgotten), "invalid", len(res.Invalid))
+	if len(res.Invalid) > 0 {
+		s.log.Warn("knowledge: fader returned NaN", "invalid", len(res.Invalid), "ids", res.Invalid[:min(len(res.Invalid), 5)])
+	}
+	s.fireFade(res)
 	return res
+}
+
+func (s *Store) fireFade(res FadeResult) {
+	for _, h := range s.hooks {
+		if h.OnFade != nil {
+			h.OnFade(res)
+		}
+	}
 }
 
 // elapsedSince returns now-settled, floored at 0 and saturating at MaxInt64.

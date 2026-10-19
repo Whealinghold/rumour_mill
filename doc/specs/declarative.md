@@ -81,7 +81,11 @@ type Bindings[C any] struct {
     Now     func(C) knowledge.Tick
     Subject func(C) string           // default subject for add_fact (often the event's actor)
     EventID func(C) string           // optional; provenance and per_event identity
+    Discriminators map[string]func(C) string // optional named sources for add_fact discriminator_from; nil entry is ErrBadBindings
+    ArgNames       ArgNames                 // optional arg renames; zero value = defaults
 }
+type ArgNames struct{ Discriminator, DiscriminatorFrom string } // json/yaml: discriminator, discriminator_from; empty = default
+func DefaultArgNames() ArgNames                                  // discriminator, discriminator_from
 func (c *Catalog[C]) RegisterKnowledgeOps(b Bindings[C]) error
 ```
 
@@ -90,9 +94,37 @@ Registers exactly two names:
 | Name | Kind | Args | Behaviour |
 | --- | --- | --- | --- |
 | `knows` | condition | `type` (req); `about_subject` bool, default false; `min_confidence` float, default store floor; `source` string or list, default any | True if the store has an unexpired matching fact (`>=` the floor). With `about_subject` the fact's subject must equal `Bindings.Subject(C)`. |
-| `add_fact` | action | `type`, `confidence`, `source` (req); `ttl` ticks, default none; `private` bool, default false; `per_event` bool, default false | Adds a fact about `Bindings.Subject(C)` observed at `Bindings.Now(C)`. With `per_event` the discriminator is `Bindings.EventID(C)`, so each occurrence is distinct; otherwise repeats merge under the store's policy. `Prov.EventID` is set when `EventID` is provided. |
+| `add_fact` | action | `type`, `confidence`, `source` (req); `ttl` ticks, default none; `private` bool, default false; `per_event` bool, default false; `discriminator` string; `discriminator_from` string (a key of `Bindings.Discriminators`) | Adds a fact about `Bindings.Subject(C)` observed at `Bindings.Now(C)`. With `per_event` the discriminator is `Bindings.EventID(C)`, so each occurrence is distinct; otherwise repeats merge under the store's policy. `discriminator` sets the identity to a literal; `discriminator_from` to the named source's result (an empty result means the default identity; an unregistered name is `ErrBadArgs` listing the registered names at load; many distinct results make many facts, bounded by `MaxFacts`). At most one of `discriminator`, `discriminator_from` and `per_event` may be given (`ErrBadArgs`). A literal containing U+001F fails at run time with `knowledge.ErrInvalidFact`. `Prov.EventID` is set when `EventID` is provided. |
 
-Everything else (same place as the event, dislikes the actor, role checks) is registered by the caller. The library ships no such names.
+`ArgNames` renames the two optional args (wiring, not `Config`); a renamed arg's default name is then unknown (`ErrBadArgs`). Renames that equal each other or any base arg of `add_fact` or `knows` are `ErrBadBindings`, as is a nil `Discriminators` entry. Allow-lists live in one helper per action, so later optional args are added in one place.
+
+Observing `add_fact` is done at the store, not in `Bindings`: `knowledge.WithHooks(Hooks{OnAdd})` and `knowledge.WithLogger` see every successful add (including spread deliveries and inference, which `add_fact`-only observation could not), so a high-cardinality `discriminator_from` under `MaxFacts` shows up as evictions there. See [knowledge](knowledge.md).
+
+Everything else (same place as the event, dislikes the actor) is registered by the caller; plain attribute comparisons (role checks) can use the optional attribute conditions below. The library ships no domain names.
+
+### Attribute conditions (optional)
+
+Relational checks that are only an attribute comparison ("the listener has role X", "teller and listener share a department") need no hand-written condition. The caller supplies one lookup function:
+
+```go
+type Attributes[C any] struct {
+    Sides  []string                                // side names a data file may use; required, non-empty
+    Lookup func(ctx C, side, key string) (any, bool) // required; key comes from data, so treat it as untrusted
+}
+type AttributeNames struct{ Equals, In, Same string } // json/yaml: equals, in, same; empty = default
+func DefaultAttributeNames() AttributeNames          // attr_equals, attr_in, attr_same
+func (c *Catalog[C]) RegisterAttributeOps(a Attributes[C], n AttributeNames) error
+```
+
+Registers exactly three conditions, named by `n` (wiring, not part of `Config` or `Document`):
+
+| Default name | Args | True when |
+| --- | --- | --- |
+| `attr_equals` | `side`, `key`, `value` (any JSON type incl. null, all required) | the attribute equals `value` |
+| `attr_in` | `side`, `key`, `values` (non-empty list) | the attribute equals any of `values` |
+| `attr_same` | `side`, `key`, `other_side` (required); `other_key` default `key` | both attributes exist and are equal |
+
+Equality: numbers of any int, uint or float kind (and loaded JSON numbers) compare by float64 value, so integers above 2^53 lose precision; other values compare with `==`; values that cannot be compared (slices, maps, structs holding them) are never equal and never panic. A missing attribute (`Lookup` returns false) makes every condition false, so `not` over it is true. `side` is checked against `Sides` when the file loads. Registration is all-or-nothing: `ErrBadBindings` for missing `Sides`/`Lookup`, `ErrDuplicateName` for equal, taken or reserved names. The closures hold no mutable state.
 
 ### Loading rules
 
@@ -126,7 +158,7 @@ Spreading filters are just conditions over `spread.Encounter`: build a `Catalog[
 
 ## 3. Errors
 
-`ErrBadArgs` (missing, mistyped, out-of-range or unknown arg), `ErrUnknownName`, `ErrWrongKind` (condition name where an action is required or vice versa), `ErrBadNode` (children on a registered name, `not` with two children, `if` without `cond`/`then`), `ErrDuplicateName` (duplicate or reserved name), `ErrBadName` (empty name or nil factory), `ErrBadBindings` (a required `Bindings` func is nil), `ErrNoStore`. Resolution errors start with a path: `node` for `Condition`/`Action`, `nodes[i]` for the list helpers, `rules[i].when`/`rules[i].do[j]` for `LoadRules`, extended with `.of[k]`, `.cond`, `.then`, `.else`. All wrap with `%w`.
+`ErrBadArgs` (missing, mistyped, out-of-range or unknown arg), `ErrUnknownName`, `ErrWrongKind` (condition name where an action is required or vice versa), `ErrBadNode` (children on a registered name, `not` with two children, `if` without `cond`/`then`), `ErrDuplicateName` (duplicate or reserved name), `ErrBadName` (empty name or nil factory), `ErrBadBindings` (a required `Bindings` func is nil, or `Attributes.Sides`/`Lookup` missing; attribute conditions add no new sentinel), `ErrNoStore`. Resolution errors start with a path: `node` for `Condition`/`Action`, `nodes[i]` for the list helpers, `rules[i].when`/`rules[i].do[j]` for `LoadRules`, extended with `.of[k]`, `.cond`, `.then`, `.else`. All wrap with `%w`.
 
 ## 4. Concurrency and determinism
 
@@ -134,19 +166,20 @@ Spreading filters are just conditions over `spread.Encounter`: build a `Catalog[
 
 ## 5. Testing
 
-Table tests cover every error above. `FuzzLoad` (arbitrary bytes through `Load`, `LoadRules`, the filter catalog and `infer.New`) and `FuzzNode` (arbitrary JSON through `Catalog.Condition`/`Action`) must never panic; a 25-second run of each found nothing.
+Table tests cover every error above. `FuzzLoad` (arbitrary bytes through `Load`, `LoadRules`, the filter catalog and `infer.New`) and `FuzzNode` (arbitrary JSON through `Catalog.Condition`/`Action`) must never panic; a 25-second run of each found nothing. Attribute conditions are covered by `attributes_test.go`: registration and renaming, equality and missing-attribute semantics, load-time errors with paths, a race test, and `Example_attributes`.
 
 ## 6. Worked examples
 
-Four runnable `Example_` tests in `declare/` load embedded JSON from `declare/testdata/`:
+Five runnable `Example_` tests in `declare/` load embedded JSON from `declare/testdata/`:
 
 - `spaceport.json` (`Example_spaceport`): custom source kinds, `default_priority`, a spreading filter built from `not`/`all`, a one-rule inference.
 - `office.json` (`Example_office`): `stop: all`, a manager filter, `on_action_error`, a two-pass inference chain with `max_passes: 2`.
 - `noir.json` (`Example_noir`): an `if`/`else` node with a nested `seq`, private facts, an inference restricted to `testimony` sources.
+- `office_depts.json` (`Example_officeDepts`): the built-in attribute conditions, an `attr_equals` rule per department and a `not(attr_same{teller, listener, dept})` spreading filter, with `being.attrs` as the attribute source.
 - `ward.json` (`Example_ward`): the generality proof, a hospital-ward staff sim written entirely as data plus the Go that registers its names; see section 7.
 
-The first three share a small generic caller type (`being`, `scene`) defined in `helpers_test.go`; the ward uses its own types and its own registrations.
+The first three and `office_depts` share a small generic caller type (`being`, `scene`) defined in `helpers_test.go`; the ward uses its own types and its own registrations.
 
 ## 7. Generality proof: the hospital ward
 
-`testdata/ward.json` is 49 lines of data (config, three rules, one spreading filter, two chained inference rules). The Go it needs (`ward_test.go`, "ward setup") is 50 non-blank lines: a `staff` type that satisfies `spread.Holder`, a `call` context, four `Bindings` one-liners, one `role_is` condition, one `listener_role_is` filter condition, two layers, and the wiring calls. No file under `knowledge/`, `logic/`, `rules/`, `spread/`, `infer/` or `declare/*.go` was changed to support it.
+`testdata/ward.json` is 49 lines of data (config, three rules, one spreading filter, two chained inference rules). The Go it needs (`ward_test.go`, "ward setup") is 48 non-blank lines, down from 50 before the built-in attribute conditions: a `staff` type that satisfies `spread.Holder`, a `call` context, four `Bindings` one-liners, two `RegisterAttributeOps` calls (one per context type, each a `Lookup` closure over `staff.role`), two layers, and the wiring calls. The hand-written `role_is` and `listener_role_is` conditions and the `roleIn` helper are gone; `ward.json` uses `attr_in` with `side`/`key`/`values`. The saving is small (2 lines) because a second context type needs a second registration. No library change beyond the new built-in attribute ops was needed for the ward, which is rewritten to use them with no ward-specific condition code.

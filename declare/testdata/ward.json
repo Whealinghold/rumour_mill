@@ -21,7 +21,7 @@
     {
       "id": "handover-escalate", "layer": "ward", "event": "shift_handover",
       "when": { "use": "all", "of": [
-        { "use": "role_is", "args": { "roles": ["nurse", "doctor"] } },
+        { "use": "attr_in", "args": { "side": "entity", "key": "role", "values": ["nurse", "doctor"] } },
         { "use": "knows", "args": { "type": "vitals_concerning", "about_subject": true, "min_confidence": 0.5 } }
       ] },
       "do": [ { "use": "add_fact", "args": { "type": "escalation_pending", "confidence": 0.8, "source": "handover" } } ]
@@ -29,7 +29,7 @@
   ],
   "spreading": {
     "filters": [
-      { "use": "not", "of": [ { "use": "listener_role_is", "args": { "roles": ["visitor", "patient"] } } ] }
+      { "use": "not", "of": [ { "use": "attr_in", "args": { "side": "listener", "key": "role", "values": ["visitor", "patient"] } } ] }
     ]
   },
   "inference": [

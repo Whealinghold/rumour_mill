@@ -2,6 +2,7 @@ package declare_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/Whealinghold/rumour_mill/declare"
@@ -230,5 +231,214 @@ func TestRegisterKnowledgeOpsErrors(t *testing.T) {
 	}
 	if err := cat.RegisterKnowledgeOps(full); !errors.Is(err, declare.ErrDuplicateName) {
 		t.Errorf("registering twice: err = %v, want ErrDuplicateName", err)
+	}
+}
+
+func discCatalog(t *testing.T, names declare.ArgNames) *declare.Catalog[scene] {
+	t.Helper()
+	cat := declare.NewCatalog[scene]()
+	err := cat.RegisterKnowledgeOps(declare.Bindings[scene]{
+		Store:    func(s scene) *knowledge.Store { return s.self.kb },
+		Now:      func(s scene) knowledge.Tick { return s.now },
+		Subject:  func(s scene) string { return s.subject },
+		EventID:  func(s scene) string { return s.evtID },
+		ArgNames: names,
+		Discriminators: map[string]func(scene) string{
+			"place": func(s scene) string { return s.place },
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cat
+}
+
+func discArgs(extra declare.Args) declare.Args {
+	a := declare.Args{"type": "t", "confidence": 0.7, "source": "observed"}
+	for k, v := range extra {
+		a[k] = v
+	}
+	return a
+}
+
+func TestDiscriminator(t *testing.T) {
+	run := func(cat *declare.Catalog[scene], extra declare.Args, places ...string) []knowledge.Fact {
+		act, err := cat.Action(declare.Node{Use: "add_fact", Args: discArgs(extra)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := sceneFor(t, "x")
+		for _, p := range places {
+			s.place = p
+			if err := act(s); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return s.self.kb.All()
+	}
+	cat := discCatalog(t, declare.ArgNames{})
+	if f := run(cat, declare.Args{"discriminator": "k"}, "a"); len(f) != 1 || f[0].Discriminator != "k" {
+		t.Errorf("literal: %+v", f)
+	}
+	if f := run(cat, declare.Args{"discriminator_from": "place"}, "a", "b"); len(f) != 2 {
+		t.Errorf("two sources, %d facts, want 2", len(f))
+	}
+	if f := run(cat, declare.Args{"discriminator_from": "place"}, "a", "a"); len(f) != 1 {
+		t.Errorf("same source, %d facts, want 1", len(f))
+	}
+	f := run(cat, declare.Args{"discriminator_from": "place"}, "")
+	g := run(cat, nil, "")
+	if len(f) != 1 || len(g) != 1 || f[0].ID != g[0].ID {
+		t.Errorf("empty result should be default identity: %+v vs %+v", f, g)
+	}
+	if f := run(cat, declare.Args{"per_event": true}, "a"); len(f) != 1 || f[0].Discriminator != "ev-1" {
+		t.Errorf("per_event unchanged: %+v", f)
+	}
+	act, _ := cat.Action(declare.Node{Use: "add_fact", Args: discArgs(declare.Args{"discriminator": "a\x1fb"})})
+	if err := act(sceneFor(t, "x")); !errors.Is(err, knowledge.ErrInvalidFact) {
+		t.Errorf("U+001F: err = %v, want ErrInvalidFact", err)
+	}
+
+	for name, extra := range map[string]declare.Args{
+		"unknown source": {"discriminator_from": "nope"},
+		"literal+from":   {"discriminator": "k", "discriminator_from": "place"},
+		"literal+event":  {"discriminator": "k", "per_event": true},
+		"from+event":     {"discriminator_from": "place", "per_event": true},
+		"literal type":   {"discriminator": 3},
+		"from type":      {"discriminator_from": 3},
+	} {
+		if _, err := cat.Action(declare.Node{Use: "add_fact", Args: discArgs(extra)}); !errors.Is(err, declare.ErrBadArgs) {
+			t.Errorf("%s: err = %v, want ErrBadArgs", name, err)
+		}
+	}
+}
+
+func TestArgNames(t *testing.T) {
+	if d := declare.DefaultArgNames(); d.Discriminator != "discriminator" || d.DiscriminatorFrom != "discriminator_from" {
+		t.Errorf("defaults = %+v", d)
+	}
+	cat := discCatalog(t, declare.ArgNames{Discriminator: "key"})
+	if _, err := cat.Action(declare.Node{Use: "add_fact", Args: discArgs(declare.Args{"key": "k"})}); err != nil {
+		t.Errorf("renamed arg: %v", err)
+	}
+	if _, err := cat.Action(declare.Node{Use: "add_fact", Args: discArgs(declare.Args{"discriminator": "k"})}); !errors.Is(err, declare.ErrBadArgs) {
+		t.Errorf("old name: err = %v, want ErrBadArgs", err)
+	}
+	if _, err := cat.Action(declare.Node{Use: "add_fact", Args: discArgs(declare.Args{"discriminator_from": "place"})}); err != nil {
+		t.Errorf("unrenamed field keeps default: %v", err)
+	}
+
+	full := declare.Bindings[scene]{
+		Store:   func(s scene) *knowledge.Store { return s.self.kb },
+		Now:     func(s scene) knowledge.Tick { return s.now },
+		Subject: func(s scene) string { return s.subject },
+	}
+	for name, mutate := range map[string]func(*declare.Bindings[scene]){
+		"nil source": func(b *declare.Bindings[scene]) { b.Discriminators = map[string]func(scene) string{"x": nil} },
+		"equal names": func(b *declare.Bindings[scene]) {
+			b.ArgNames = declare.ArgNames{Discriminator: "z", DiscriminatorFrom: "z"}
+		},
+		"base collision":  func(b *declare.Bindings[scene]) { b.ArgNames = declare.ArgNames{Discriminator: "ttl"} },
+		"knows collision": func(b *declare.Bindings[scene]) { b.ArgNames = declare.ArgNames{DiscriminatorFrom: "min_confidence"} },
+	} {
+		b := full
+		mutate(&b)
+		if err := declare.NewCatalog[scene]().RegisterKnowledgeOps(b); !errors.Is(err, declare.ErrBadBindings) {
+			t.Errorf("%s: err = %v, want ErrBadBindings", name, err)
+		}
+	}
+}
+
+func discCatalogWith(t *testing.T, names declare.ArgNames, src map[string]func(scene) string) *declare.Catalog[scene] {
+	t.Helper()
+	cat := declare.NewCatalog[scene]()
+	err := cat.RegisterKnowledgeOps(declare.Bindings[scene]{
+		Store:          func(s scene) *knowledge.Store { return s.self.kb },
+		Now:            func(s scene) knowledge.Tick { return s.now },
+		Subject:        func(s scene) string { return s.subject },
+		ArgNames:       names,
+		Discriminators: src,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cat
+}
+
+func TestDiscriminatorsMapCopied(t *testing.T) {
+	src := map[string]func(scene) string{"place": func(s scene) string { return s.place }}
+	cat := discCatalogWith(t, declare.ArgNames{}, src)
+	delete(src, "place")
+	src["place"] = func(scene) string { return "hijacked" }
+	act, err := cat.Action(declare.Node{Use: "add_fact", Args: discArgs(declare.Args{"discriminator_from": "place"})})
+	if err != nil {
+		t.Fatalf("deleting from the caller's map broke a later load: %v", err)
+	}
+	s := sceneFor(t, "x")
+	s.place = "real"
+	if err := act(s); err != nil {
+		t.Fatal(err)
+	}
+	if f := s.self.kb.All(); len(f) != 1 || f[0].Discriminator != "real" {
+		t.Errorf("caller's replacement leaked: %+v", f)
+	}
+}
+
+func TestUnknownSourceListsSorted(t *testing.T) {
+	cat := discCatalogWith(t, declare.ArgNames{}, map[string]func(scene) string{
+		"zeta":  func(scene) string { return "z" },
+		"alpha": func(scene) string { return "a" },
+	})
+	_, err := cat.Action(declare.Node{Use: "add_fact", Args: discArgs(declare.Args{"discriminator_from": "nope"})})
+	if !errors.Is(err, declare.ErrBadArgs) {
+		t.Fatalf("err = %v", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "[alpha zeta]") {
+		t.Errorf("sources not listed sorted: %s", msg)
+	}
+}
+
+func TestRenamedDiscriminatorRuns(t *testing.T) {
+	cat := discCatalogWith(t, declare.ArgNames{Discriminator: "id_part", DiscriminatorFrom: "id_part_from"},
+		map[string]func(scene) string{"place": func(s scene) string { return s.place }})
+	run := func(extra declare.Args, places ...string) []knowledge.Fact {
+		act, err := cat.Action(declare.Node{Use: "add_fact", Args: discArgs(extra)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := sceneFor(t, "x")
+		for _, p := range places {
+			s.place = p
+			if err := act(s); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return s.self.kb.All()
+	}
+	if f := run(declare.Args{"id_part_from": "place"}, "a", "b"); len(f) != 2 {
+		t.Errorf("different values: %d facts, want 2", len(f))
+	}
+	if f := run(declare.Args{"id_part_from": "place"}, "a", "a"); len(f) != 1 {
+		t.Errorf("same value: %d facts, want 1", len(f))
+	}
+	if f := run(declare.Args{"id_part": "k"}, "a"); len(f) != 1 || f[0].Discriminator != "k" {
+		t.Errorf("renamed literal: %+v", f)
+	}
+	for _, old := range []declare.Args{{"discriminator": "k"}, {"discriminator_from": "place"}} {
+		if _, err := cat.Action(declare.Node{Use: "add_fact", Args: discArgs(old)}); !errors.Is(err, declare.ErrBadArgs) {
+			t.Errorf("old name %v: err = %v, want ErrBadArgs", old, err)
+		}
+	}
+
+	// Renaming only one leaves the other default working.
+	onlyLit := discCatalogWith(t, declare.ArgNames{Discriminator: "id_part"},
+		map[string]func(scene) string{"place": func(s scene) string { return s.place }})
+	if _, err := onlyLit.Action(declare.Node{Use: "add_fact", Args: discArgs(declare.Args{"discriminator_from": "place"})}); err != nil {
+		t.Errorf("default discriminator_from after renaming the other: %v", err)
+	}
+	onlyFrom := discCatalogWith(t, declare.ArgNames{DiscriminatorFrom: "id_part_from"}, nil)
+	if _, err := onlyFrom.Action(declare.Node{Use: "add_fact", Args: discArgs(declare.Args{"discriminator": "k"})}); err != nil {
+		t.Errorf("default discriminator after renaming the other: %v", err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Whealinghold/rumour_mill/declare"
 	"github.com/Whealinghold/rumour_mill/knowledge"
 	"github.com/Whealinghold/rumour_mill/rules"
 	"github.com/Whealinghold/rumour_mill/spread"
@@ -116,4 +117,51 @@ func Example_noir() {
 	// mabel told the cabbie 2 facts; her private ones stayed with her
 	//   cabbie: alibi_false mr-vane@0.400 rumour
 	//   cabbie: motive_known mr-vane@0.300 rumour
+}
+
+// A data file can set a fact's identity: the same source value merges into one
+// fact, a different one makes a second fact.
+func Example_discriminator() {
+	cat := declare.NewCatalog[scene]()
+	_ = cat.RegisterKnowledgeOps(declare.Bindings[scene]{
+		Store:          func(s scene) *knowledge.Store { return s.self.kb },
+		Now:            func(s scene) knowledge.Tick { return s.now },
+		Subject:        func(s scene) string { return s.subject },
+		Discriminators: map[string]func(scene) string{"room": func(s scene) string { return s.place }},
+	})
+	act, _ := cat.Action(declare.Node{Use: "add_fact", Args: declare.Args{
+		"type": "spilled_coffee", "confidence": 0.9, "source": "seen", "discriminator_from": "room",
+	}})
+	kb, _ := knowledge.NewStore(knowledge.DefaultConfig())
+	s := scene{self: &being{id: "pat", kb: kb}, subject: "sam"}
+	for _, room := range []string{"kitchen", "kitchen", "lobby"} {
+		s.place = room
+		_ = act(s)
+	}
+	fmt.Println(len(kb.All()), "facts")
+	// Output: 2 facts
+}
+
+// Built-in attribute conditions, from testdata/office_depts.json: a rule that
+// fires only for one department, and a spreading filter that lets gossip cross
+// department lines only.
+func Example_officeDepts() {
+	w := load("office_depts.json", rules.Layer[scene]{Name: "company"})
+	fin := w.being("fay", "dept", "finance")
+	ops := w.being("oli", "dept", "ops")
+	ops2 := w.being("ona", "dept", "ops")
+	for _, b := range []*being{fin, ops} {
+		res, err := w.reg.Process(scene{self: b, subject: "company", now: 5}, "budget_meeting")
+		fmt.Printf("%s %s\n", b.id, fired(res, err))
+	}
+	res, _ := w.sp.Spread(fin, []spread.Holder{ops, ops2}, 6)
+	fmt.Println("fay told", len(res.Transfers), "of 2")
+	res, _ = w.sp.Spread(ops, []spread.Holder{ops2}, 7)
+	fmt.Println("oli told", len(res.Transfers), "of 1 (same department)")
+
+	// Output:
+	// fay [company/finance-hears-first] err=<nil>
+	// oli [] err=<nil>
+	// fay told 2 of 2
+	// oli told 0 of 1 (same department)
 }
